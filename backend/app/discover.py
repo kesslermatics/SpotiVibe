@@ -176,9 +176,20 @@ async def discover_songs(
         *(fetch_song(song) for song in gemini_result.get("songs", []))
     )
 
+    # Deduplicate by Spotify URI (Gemini may suggest the same song twice with different spelling)
+    seen_uris: set[str] = set()
+    unique_songs = []
+    for song in songs:
+        uri = song.get("spotify_uri")
+        if uri:
+            if uri in seen_uris:
+                continue
+            seen_uris.add(uri)
+        unique_songs.append(song)
+
     return {
         "mood_summary": gemini_result.get("mood_summary", ""),
         "playlist_name": gemini_result.get("playlist_name"),
         "playlist_description": gemini_result.get("playlist_description"),
-        "songs": list(songs),
+        "songs": unique_songs,
     }

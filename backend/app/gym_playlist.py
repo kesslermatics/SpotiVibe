@@ -420,12 +420,16 @@ async def generate_gym_playlist(
     # 4. Search each song on Spotify (sequential with delay)
     logger.info("Gym Playlist: Searching songs on Spotify...")
     uris: list[str] = []
+    seen_uris: set[str] = set()
     for song in gemini_songs:
         result = await robust_spotify_search_with_cache(
             song["title"], song["artist"], spotify_token
         )
         if result and result.get("uri"):
-            uris.append(result["uri"])
+            uri = result["uri"]
+            if uri not in seen_uris:
+                uris.append(uri)
+                seen_uris.add(uri)
         await asyncio.sleep(1.0)
 
     logger.info(f"Gym Playlist: Found {len(uris)} tracks on Spotify")
