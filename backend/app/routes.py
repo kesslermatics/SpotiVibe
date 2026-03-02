@@ -176,24 +176,14 @@ async def discover(
                 playlist_name = result.get("playlist_name") or "Discover Mix"
                 playlist_desc = result.get("playlist_description") or result.get("mood_summary", "")
 
-                # Get user's Spotify ID
-                async with httpx.AsyncClient() as client:
-                    me_resp = await client.get(
-                        f"{SPOTIFY_API_BASE}/me",
-                        headers={"Authorization": f"Bearer {spotify_token}"},
-                    )
-                if me_resp.status_code != 200:
-                    raise Exception(f"Could not get Spotify user: {me_resp.status_code}")
-                spotify_user_id = me_resp.json()["id"]
+                # Refresh token (may have gone stale during Gemini + search pipeline)
+                spotify_token = await get_valid_spotify_token(current_user, db)
 
-                # Create playlist
+                # Create playlist via /me/playlists (works in dev mode)
                 async with httpx.AsyncClient() as client:
                     create_resp = await client.post(
-                        f"{SPOTIFY_API_BASE}/users/{spotify_user_id}/playlists",
-                        headers={
-                            "Authorization": f"Bearer {spotify_token}",
-                            "Content-Type": "application/json",
-                        },
+                        f"{SPOTIFY_API_BASE}/me/playlists",
+                        headers={"Authorization": f"Bearer {spotify_token}"},
                         json={
                             "name": playlist_name,
                             "description": playlist_desc,
