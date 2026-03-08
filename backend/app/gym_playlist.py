@@ -473,9 +473,9 @@ async def generate_gym_playlist(
 
     # 6. Create new playlist with unique name
     today = date.today().strftime("%d.%m.%Y")
-    playlist_name = f"🏋️ VibeSwipe Gym Mix – {today}"
+    playlist_name = f"🏋️ SpotiVibe Gym Mix – {today}"
     playlist_desc = (
-        f"Your personal Gym Power Mix by VibeSwipe 💪 "
+        f"Your personal Gym Power Mix by SpotiVibe 💪 "
         f"{len(uris)} motivating tracks"
     )
 
