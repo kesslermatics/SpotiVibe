@@ -150,6 +150,7 @@ async def discover(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    logger.info(f"[Discover Route] Request from user={current_user.spotify_id}, prompt='{payload.prompt[:80]}...', include_my_taste={payload.include_my_taste}, save_to_playlist={payload.save_to_playlist}")
     spotify_token = await get_valid_spotify_token(current_user, db)
 
     try:
@@ -158,8 +159,9 @@ async def discover(
         if payload.include_my_taste:
             try:
                 on_repeat_songs = await fetch_on_repeat_tracks(spotify_token)
+                logger.debug(f"[Discover Route] Fetched {len(on_repeat_songs) if on_repeat_songs else 0} on-repeat tracks")
             except Exception as e:
-                logger.warning(f"Could not fetch on-repeat tracks: {e}")
+                logger.warning(f"[Discover Route] Could not fetch on-repeat tracks: {e}")
 
         result = await discover_songs(
             payload.prompt,
@@ -218,8 +220,12 @@ async def discover(
                 result["playlist_id"] = playlist_id
                 result["playlist_name"] = playlist_name
 
+        logger.info(f"[Discover Route] Success - returning {len(result.get('songs', []))} songs")
         return result
     except Exception as e:
+        import traceback
+        logger.error(f"[Discover Route] FAILED for user={current_user.spotify_id}: {e}")
+        logger.error(f"[Discover Route] Traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Discovery failed: {str(e)}",

@@ -1,8 +1,10 @@
 import json
 import asyncio
+import logging
 import httpx
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 GEMINI_URL = (
@@ -62,6 +64,7 @@ async def ask_gemini(
     save_to_playlist: bool = False,
 ) -> dict:
     """Ask Gemini to interpret the mood and suggest songs."""
+    logger.info(f"[Discover] ask_gemini called - prompt: '{prompt[:100]}...', context_songs: {len(context_songs) if context_songs else 0}, on_repeat: {len(on_repeat_songs) if on_repeat_songs else 0}, save_to_playlist: {save_to_playlist}")
     system = SYSTEM_PROMPT_WITH_PLAYLIST if save_to_playlist else SYSTEM_PROMPT
     parts = [{"text": system}]
 
@@ -99,14 +102,22 @@ async def ask_gemini(
         },
     }
 
+    logger.debug(f"[Discover] Sending request to Gemini API...")
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(GEMINI_URL, json=payload)
 
     if resp.status_code != 200:
+        logger.error(f"[Discover] Gemini API error: status={resp.status_code}, body={resp.text[:500]}")
         raise Exception(f"Gemini API error: {resp.status_code} – {resp.text}")
 
+    logger.debug(f"[Discover] Gemini response received, status={resp.status_code}")
     data = resp.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
+    
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as e:
+        logger.error(f"[Discover] Unexpected Gemini response structure: {e}, data={json.dumps(data)[:500]}")
+        raise Exception(f"Unexpected Gemini response: {e}")
 
     # Strip markdown code fences if present
     text = text.strip()
@@ -116,7 +127,13 @@ async def ask_gemini(
             text = text[:-3]
         text = text.strip()
 
-    return json.loads(text)
+    try:
+        result = json.loads(text)
+        logger.info(f"[Discover] Gemini returned {len(result.get('songs', []))} songs, mood: '{result.get('mood_summary', '')[:50]}'")
+        return result
+    except json.JSONDecodeError as e:
+        logger.error(f"[Discover] Failed to parse Gemini JSON: {e}, raw text: {text[:500]}")
+        raise Exception(f"Invalid JSON from Gemini: {e}")
 
 
 async def search_spotify(query: str, spotify_token: str) -> dict | None:
@@ -129,6 +146,7 @@ async def search_spotify(query: str, spotify_token: str) -> dict | None:
         )
 
     if resp.status_code != 200:
+        logger.warning(f"[Discover] Spotify search failed for '{query}': status={resp.status_code}, body={resp.text[:200]}")
         return None
 
     items = resp.json().get("tracks", {}).get("items", [])
@@ -156,7 +174,13 @@ async def discover_songs(
     save_to_playlist: bool = False,
 ) -> dict:
     """Full pipeline: Gemini interprets mood → Spotify searches for each song (parallel)."""
-    gemini_result = await ask_gemini(prompt, context_songs, on_repeat_songs, save_to_playlist)
+    logger.info(f"[Discover] discover_songs called - prompt: '{prompt[:80]}...'")
+    
+    try:
+        gemini_result = await ask_gemini(prompt, context_songs, on_repeat_songs, save_to_playlist)
+    except Exception as e:
+        logger.error(f"[Discover] Gemini call failed: {e}")
+        raise
 
     async def fetch_song(song: dict) -> dict:
         query = f"{song['title']} {song['artist']}"
@@ -172,9 +196,13 @@ async def discover_songs(
             "spotify_uri": None,
         }
 
+    logger.info(f"[Discover] Starting Spotify search for {len(gemini_result.get('songs', []))} songs...")
     songs = await asyncio.gather(
         *(fetch_song(song) for song in gemini_result.get("songs", []))
     )
+    
+    found_count = sum(1 for s in songs if s.get("spotify_uri"))
+    logger.info(f"[Discover] Spotify search complete: {found_count}/{len(songs)} songs found")
 
     # Deduplicate by Spotify URI (Gemini may suggest the same song twice with different spelling)
     seen_uris: set[str] = set()
@@ -187,6 +215,7 @@ async def discover_songs(
             seen_uris.add(uri)
         unique_songs.append(song)
 
+    logger.info(f"[Discover] Returning {len(unique_songs)} unique songs (deduplicated from {len(songs)})")
     return {
         "mood_summary": gemini_result.get("mood_summary", ""),
         "playlist_name": gemini_result.get("playlist_name"),

@@ -12,6 +12,13 @@ from app.database import engine, Base
 from app.routes import router
 from app.gym_playlist import auto_refresh_gym_playlists
 
+# Configure logging to show INFO and above
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
