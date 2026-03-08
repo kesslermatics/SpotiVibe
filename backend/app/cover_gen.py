@@ -34,21 +34,21 @@ async def generate_playlist_cover(
     """
     # Build a creative prompt for the image
     desc = playlist_description or mood_summary
-    prompt = f"""Create a stylish, artistic album cover for a Spotify playlist.
+    prompt = f"""Create a stylish album cover for a Spotify playlist.
 
 Playlist name: "{playlist_name}"
 Mood/Vibe: {mood_summary}
 Description: {desc}
 
 Requirements:
-- Abstract, artistic style (no text, no letters, no words)
-- Vibrant colors that match the mood
-- Modern, clean aesthetic suitable for a music streaming app
+- NO text, NO letters, NO words anywhere in the image
+- Colors and style should match the mood perfectly
+- Modern, cinematic aesthetic suitable for a music streaming app
 - Square format, visually striking
-- No faces, no people, no photorealistic elements
-- Think: gradient backgrounds, geometric shapes, abstract patterns, nature elements
+- Can include people, objects, scenes that represent the vibe
+- Be creative and thematic: if it's about success/CEO vibes, show luxury items, a man in a suit, cigars, fancy desk. If it's about sadness, show rain, lonely scenes. Match the THEME.
 
-Create an image that captures the FEELING of this music."""
+Create an image that looks like a real album cover and captures the ESSENCE of this playlist."""
 
     payload = {
         "contents": [
