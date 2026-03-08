@@ -200,7 +200,7 @@ Rules:
         },
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(GEMINI_URL, json=payload)
 
     if resp.status_code != 200:

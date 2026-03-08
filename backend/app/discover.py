@@ -103,7 +103,7 @@ async def ask_gemini(
     }
 
     logger.debug(f"[Discover] Sending request to Gemini API...")
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(GEMINI_URL, json=payload)
 
     if resp.status_code != 200:

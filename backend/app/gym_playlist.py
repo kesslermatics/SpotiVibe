@@ -96,7 +96,7 @@ async def fetch_playlist_tracks(
     headers = {"Authorization": f"Bearer {spotify_token}"}
     current_token = spotify_token
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         while url:
             print(f"[GYM DEBUG] Fetching {url} with params={params}")
             resp = await client.get(url, params=params, headers=headers)
@@ -336,7 +336,7 @@ Here are the user's inspiration songs (analyze genres carefully):
         },
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(GEMINI_URL, json=payload)
 
     if resp.status_code != 200:

@@ -187,7 +187,7 @@ Rules:
             logger.info(f"Roast Gemini retry {attempt + 1}/3")
             await asyncio.sleep(1)
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(GEMINI_URL, json=payload)
 
         if resp.status_code != 200:
