@@ -91,12 +91,7 @@ Create an image that looks like a real album cover and captures the ESSENCE of t
                 if image_data:
                     logger.info(f"[CoverGen] Got image, mimeType={mime_type}, size={len(image_data)} chars")
                     
-                    # If it's already JPEG, return as-is
-                    if "jpeg" in mime_type.lower() or "jpg" in mime_type.lower():
-                        return image_data
-                    
-                    # Otherwise, we need to convert to JPEG
-                    # Decode, convert with PIL, re-encode
+                    # Always process through PIL to ensure correct size for Spotify (max 256KB)
                     try:
                         from PIL import Image
                         
@@ -110,20 +105,25 @@ Create an image that looks like a real album cover and captures the ESSENCE of t
                         # Resize to 640x640 (Spotify recommended)
                         img = img.resize((640, 640), Image.Resampling.LANCZOS)
                         
-                        # Save as JPEG with good quality
-                        buffer = BytesIO()
-                        img.save(buffer, format="JPEG", quality=85)
-                        jpeg_bytes = buffer.getvalue()
-                        
-                        # Check size (Spotify limit: 256KB)
-                        if len(jpeg_bytes) > 256 * 1024:
-                            # Reduce quality
+                        # Save as JPEG, progressively reduce quality until under 256KB
+                        jpeg_bytes = None
+                        for quality in [85, 70, 55, 40]:
                             buffer = BytesIO()
-                            img.save(buffer, format="JPEG", quality=60)
+                            img.save(buffer, format="JPEG", quality=quality)
                             jpeg_bytes = buffer.getvalue()
+                            if len(jpeg_bytes) <= 256 * 1024:
+                                logger.info(f"[CoverGen] Compressed to {len(jpeg_bytes)} bytes at quality={quality}")
+                                break
+                        
+                        if jpeg_bytes and len(jpeg_bytes) > 256 * 1024:
+                            # Still too big - resize smaller
+                            img = img.resize((500, 500), Image.Resampling.LANCZOS)
+                            buffer = BytesIO()
+                            img.save(buffer, format="JPEG", quality=50)
+                            jpeg_bytes = buffer.getvalue()
+                            logger.info(f"[CoverGen] Resized to 500x500, final size={len(jpeg_bytes)} bytes")
                         
                         jpeg_b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
-                        logger.info(f"[CoverGen] Converted to JPEG, final size={len(jpeg_bytes)} bytes")
                         return jpeg_b64
                         
                     except ImportError:
@@ -159,6 +159,10 @@ async def upload_playlist_cover(
     """
     url = f"https://api.spotify.com/v1/playlists/{playlist_id}/images"
     
+    # Check size before upload
+    image_bytes_size = len(image_base64) * 3 // 4  # Approximate decoded size
+    logger.info(f"[CoverGen] Uploading cover (~{image_bytes_size // 1024}KB) to playlist {playlist_id}")
+    
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.put(
@@ -178,5 +182,6 @@ async def upload_playlist_cover(
             return False
             
     except Exception as e:
-        logger.error(f"[CoverGen] Upload failed: {e}")
+        import traceback
+        logger.error(f"[CoverGen] Upload failed: {e}\n{traceback.format_exc()}")
         return False
