@@ -74,9 +74,9 @@ async def ask_gemini(
     system = SYSTEM_PROMPT_WITH_PLAYLIST if save_to_playlist else SYSTEM_PROMPT
     parts = [{"text": system}]
 
-    # If the user provided a playlist as context, include it
+    # If the user provided a playlist as context, include it (limit to 30 for performance)
     if context_songs:
-        song_list = "\n".join(f"- {s}" for s in context_songs)
+        song_list = "\n".join(f"- {s}" for s in context_songs[:30])
         parts.append({
             "text": (
                 f"The user has a playlist with these songs as reference:\n{song_list}\n\n"
@@ -86,9 +86,9 @@ async def ask_gemini(
             )
         })
 
-    # If "include my taste" is enabled, add user's top tracks as style reference
+    # If "include my taste" is enabled, add user's top tracks as style reference (limit to 25)
     if on_repeat_songs:
-        taste_list = "\n".join(f"- {s['title']} by {s['artist']}" for s in on_repeat_songs[:30])
+        taste_list = "\n".join(f"- {s['title']} by {s['artist']}" for s in on_repeat_songs[:25])
         parts.append({
             "text": (
                 f"Here are the user's current favorite/most-played songs (their taste profile):\n{taste_list}\n\n"
@@ -108,9 +108,37 @@ async def ask_gemini(
         },
     }
 
-    logger.debug(f"[Discover] Sending request to Gemini API...")
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(GEMINI_URL, json=payload)
+    # Retry logic with increasing timeout
+    last_error = None
+    for attempt in range(3):
+        timeout = 180 + (attempt * 60)  # 180s, 240s, 300s
+        if attempt > 0:
+            logger.info(f"[Discover] Retry {attempt + 1}/3 with timeout={timeout}s...")
+            await asyncio.sleep(2)
+        
+        try:
+            logger.debug(f"[Discover] Sending request to Gemini API (timeout={timeout}s)...")
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(GEMINI_URL, json=payload)
+            
+            if resp.status_code == 200:
+                break
+            else:
+                last_error = f"Gemini API error: {resp.status_code} – {resp.text[:300]}"
+                logger.warning(f"[Discover] Attempt {attempt + 1} failed: {last_error}")
+                continue
+                
+        except httpx.ReadTimeout:
+            last_error = f"Timeout after {timeout}s"
+            logger.warning(f"[Discover] Attempt {attempt + 1} timed out after {timeout}s")
+            continue
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"[Discover] Attempt {attempt + 1} failed: {e}")
+            continue
+    else:
+        logger.error(f"[Discover] All 3 attempts failed. Last error: {last_error}")
+        raise Exception(f"Gemini API failed after 3 attempts: {last_error}")
 
     if resp.status_code != 200:
         logger.error(f"[Discover] Gemini API error: status={resp.status_code}, body={resp.text[:500]}")
