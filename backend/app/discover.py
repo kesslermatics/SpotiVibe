@@ -12,6 +12,12 @@ GEMINI_URL = (
     f"gemini-3.1-pro-preview:generateContent?key={settings.gemini_api_key}"
 )
 
+# Fast model for QA validation
+GEMINI_FLASH_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"gemini-3.1-pro-preview:generateContent?key={settings.gemini_api_key}"
+)
+
 SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
 
 SYSTEM_PROMPT = """You are a music recommendation expert. The user will describe a mood, vibe, activity, or specific song preferences.
@@ -166,6 +172,116 @@ async def search_spotify(query: str, spotify_token: str) -> dict | None:
     }
 
 
+async def validate_spotify_matches(
+    original_prompt: str,
+    gemini_recommendations: list[dict],
+    spotify_results: list[dict],
+) -> list[dict]:
+    """
+    QA Step: Ask Gemini to validate that Spotify search results match the original recommendations.
+    Filters out mismatches where Spotify returned a different song than what was requested.
+    """
+    # Build comparison list: original request vs what Spotify found
+    comparisons = []
+    for i, (orig, found) in enumerate(zip(gemini_recommendations, spotify_results)):
+        if not found.get("spotify_uri"):
+            continue  # Skip songs not found on Spotify
+        comparisons.append({
+            "index": i,
+            "requested": f"{orig['title']} - {orig['artist']}",
+            "found": f"{found['title']} - {found['artist']}",
+            "spotify_uri": found["spotify_uri"],
+        })
+    
+    if not comparisons:
+        return spotify_results
+    
+    # Build the validation prompt
+    comparison_text = "\n".join(
+        f"{c['index']+1}. Requested: \"{c['requested']}\" → Found: \"{c['found']}\""
+        for c in comparisons
+    )
+    
+    validation_prompt = f"""You are a music expert doing quality assurance on a playlist.
+
+Original user request: "{original_prompt}"
+
+The AI recommended songs, and Spotify search returned these results. Some might be WRONG matches (different song, cover version, wrong artist, completely different track).
+
+Compare each pair and decide if the found song is CORRECT (same song or acceptable match) or WRONG (different song, wrong artist, not what was requested):
+
+{comparison_text}
+
+Respond ONLY with valid JSON listing the INDICES of WRONG matches (songs that should be removed):
+{{
+  "wrong_indices": [1, 5, 12]
+}}
+
+If ALL matches are correct, return:
+{{
+  "wrong_indices": []
+}}
+
+Rules:
+- A song is CORRECT if it's the same song (even with slight title variations like "Remastered" or "Live")
+- A song is WRONG if it's a completely different song, a cover by another artist, or unrelated
+- Be strict: if the artist is completely different, it's WRONG
+- Only output valid JSON, no explanation"""
+
+    payload = {
+        "contents": [{"parts": [{"text": validation_prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,  # Low temperature for consistent judgement
+            "maxOutputTokens": 1024,
+        },
+    }
+
+    try:
+        logger.info(f"[Discover QA] Validating {len(comparisons)} Spotify matches...")
+        
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(GEMINI_FLASH_URL, json=payload)
+        
+        if resp.status_code != 200:
+            logger.warning(f"[Discover QA] Validation API error: {resp.status_code}, skipping QA")
+            return spotify_results
+        
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        
+        # Parse JSON
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+        
+        result = json.loads(text)
+        wrong_indices = set(result.get("wrong_indices", []))
+        
+        if wrong_indices:
+            logger.info(f"[Discover QA] Found {len(wrong_indices)} mismatches, filtering out...")
+            
+            # Create a set of spotify_uris to remove
+            uris_to_remove = set()
+            for c in comparisons:
+                if (c["index"] + 1) in wrong_indices:  # +1 because we showed 1-indexed
+                    uris_to_remove.add(c["spotify_uri"])
+                    logger.debug(f"[Discover QA] Removing mismatch: {c['requested']} ≠ {c['found']}")
+            
+            # Filter the results
+            filtered = [s for s in spotify_results if s.get("spotify_uri") not in uris_to_remove]
+            logger.info(f"[Discover QA] Kept {len(filtered)}/{len(spotify_results)} songs after validation")
+            return filtered
+        else:
+            logger.info(f"[Discover QA] All {len(comparisons)} matches validated OK")
+            return spotify_results
+            
+    except Exception as e:
+        logger.warning(f"[Discover QA] Validation failed: {e}, skipping QA step")
+        return spotify_results
+
+
 async def discover_songs(
     prompt: str,
     spotify_token: str,
@@ -203,6 +319,13 @@ async def discover_songs(
     
     found_count = sum(1 for s in songs if s.get("spotify_uri"))
     logger.info(f"[Discover] Spotify search complete: {found_count}/{len(songs)} songs found")
+
+    # QA Step: Validate Spotify matches against original Gemini recommendations
+    songs = await validate_spotify_matches(
+        original_prompt=prompt,
+        gemini_recommendations=gemini_result.get("songs", []),
+        spotify_results=list(songs),
+    )
 
     # Deduplicate by Spotify URI (Gemini may suggest the same song twice with different spelling)
     seen_uris: set[str] = set()
