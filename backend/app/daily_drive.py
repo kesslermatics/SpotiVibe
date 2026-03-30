@@ -36,31 +36,86 @@ GEMINI_URL = (
 # Redis Client initialisieren
 redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
 
+# History TTL: 5 days – keeps track of recently used Daily Drive songs
+HISTORY_TTL = 5 * 24 * 60 * 60  # 5 days in seconds
+
+
 # Hilfsfunktion: Key für Song generieren
 def song_cache_key(title: str, artist: str) -> str:
     return f"song_uri::{title.lower().strip()}|||{artist.lower().strip()}"
 
-async def fetch_on_repeat_tracks(spotify_token: str) -> list[dict]:
-    """Fetch user's top tracks (short_term ≈ On Repeat, up to 50)."""
-    all_tracks = []
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{SPOTIFY_API}/me/top/tracks",
-            params={"time_range": "short_term", "limit": 50},
-            headers={"Authorization": f"Bearer {spotify_token}"},
-        )
-    if resp.status_code != 200:
-        logger.error(f"Failed to fetch top tracks: {resp.status_code} {resp.text[:300]}")
-        raise Exception(f"Could not fetch On-Repeat tracks: {resp.status_code}")
 
-    data = resp.json()
-    for item in data.get("items", []):
-        all_tracks.append({
-            "title": item["name"],
-            "artist": ", ".join(a["name"] for a in item.get("artists", [])),
-            "uri": item["uri"],
-            "id": item["id"],
-        })
+def daily_drive_history_key(user_id: int) -> str:
+    return f"daily_drive_history::{user_id}"
+
+
+def save_daily_drive_history(user_id: int, songs: list[dict]) -> None:
+    """Save generated Daily Drive songs to Redis so they can be avoided next time.
+    Songs expire after 5 days automatically via TTL."""
+    key = daily_drive_history_key(user_id)
+    try:
+        entries = [f"{s['title'].lower().strip()} - {s['artist'].lower().strip()}" for s in songs]
+        existing = set(redis_client.lrange(key, 0, -1))
+        for entry in entries:
+            if entry not in existing:
+                redis_client.rpush(key, entry)
+        # Cap history at 200 entries to avoid bloat, keep newest
+        current_len = redis_client.llen(key)
+        if current_len > 200:
+            redis_client.ltrim(key, current_len - 200, -1)
+        redis_client.expire(key, HISTORY_TTL)
+        logger.info(f"Daily Drive History: Saved {len(entries)} songs for user {user_id} (total: {redis_client.llen(key)})")
+    except Exception as e:
+        logger.warning(f"Daily Drive History: Could not save history: {e}")
+
+
+def get_daily_drive_history(user_id: int) -> list[str]:
+    """Get recently used Daily Drive songs from Redis (last 5 days)."""
+    key = daily_drive_history_key(user_id)
+    try:
+        history = redis_client.lrange(key, 0, -1)
+        logger.info(f"Daily Drive History: Found {len(history)} recent songs for user {user_id}")
+        return history
+    except Exception as e:
+        logger.warning(f"Daily Drive History: Could not read history: {e}")
+        return []
+
+async def fetch_on_repeat_tracks(spotify_token: str) -> list[dict]:
+    """Fetch user's top tracks from short_term AND medium_term for a bigger pool.
+    short_term ≈ On Repeat (last ~4 weeks), medium_term ≈ last ~6 months.
+    Merges both, deduplicates by URI, short_term first (higher priority)."""
+    all_tracks = []
+    seen_uris: set[str] = set()
+
+    async with httpx.AsyncClient() as client:
+        # Fetch short_term first (most recent favorites)
+        for time_range in ["short_term", "medium_term"]:
+            resp = await client.get(
+                f"{SPOTIFY_API}/me/top/tracks",
+                params={"time_range": time_range, "limit": 50},
+                headers={"Authorization": f"Bearer {spotify_token}"},
+            )
+            if resp.status_code != 200:
+                if time_range == "short_term":
+                    logger.error(f"Failed to fetch top tracks ({time_range}): {resp.status_code} {resp.text[:300]}")
+                    raise Exception(f"Could not fetch On-Repeat tracks: {resp.status_code}")
+                else:
+                    logger.warning(f"Failed to fetch medium_term tracks: {resp.status_code} (non-fatal)")
+                    continue
+
+            data = resp.json()
+            for item in data.get("items", []):
+                uri = item["uri"]
+                if uri not in seen_uris:
+                    seen_uris.add(uri)
+                    all_tracks.append({
+                        "title": item["name"],
+                        "artist": ", ".join(a["name"] for a in item.get("artists", [])),
+                        "uri": uri,
+                        "id": item["id"],
+                    })
+
+    logger.info(f"Daily Drive: Fetched {len(all_tracks)} unique top tracks (short + medium term)")
     return all_tracks
 
 
@@ -152,8 +207,9 @@ async def fetch_show_episodes(show_id: str, spotify_token: str, limit: int = 50)
     return episodes
 
 
-async def ask_gemini_daily_drive(on_repeat_songs: list[dict]) -> dict:
-    """Ask Gemini to curate the Daily Drive song selection."""
+async def ask_gemini_daily_drive(on_repeat_songs: list[dict], recent_history: list[str] | None = None) -> dict:
+    """Ask Gemini to curate the Daily Drive song selection.
+    If recent_history is provided, Gemini will avoid those songs for better variation."""
     song_list = "\n".join(
         f"- {s['title']} – {s['artist']}" for s in on_repeat_songs
     )
@@ -161,14 +217,30 @@ async def ask_gemini_daily_drive(on_repeat_songs: list[dict]) -> dict:
     num_from_repeat = min(20, len(on_repeat_songs))
     num_new = 20
 
+    # Build avoidance block from history
+    avoid_block = ""
+    if recent_history:
+        avoid_list = "\n".join(f"- {s}" for s in recent_history[:150])  # cap to avoid prompt overflow
+        avoid_block = f"""
+
+CRITICAL – AVOID REPEATS: The following songs were already used in recent Daily Drive playlists (last few days).
+You MUST NOT include ANY of these songs in your "new_discoveries" list. Pick COMPLETELY DIFFERENT songs instead.
+Also try to pick DIFFERENT songs from the on-repeat list than what was used before (choose ones not in this avoid list):
+{avoid_list}
+"""
+
+    # Generate a random seed to encourage different outputs each time
+    seed_hint = random.randint(1000, 9999)
+
     prompt = f"""You are a music curation expert building a "Daily Drive" playlist.
+Today's session seed: {seed_hint} (use this to vary your picks – be creative and surprising!)
 
 I will give you a list of songs that the user currently has on repeat (their favorite songs right now).
 
 Your task:
-1. Pick exactly {num_from_repeat} songs FROM the provided list. Choose a good mix that flows well together. Use the EXACT titles and artists as given.
-2. Recommend exactly {num_new} NEW songs that are NOT in the provided list but perfectly match the style, mood, genre, and energy of these songs. These should be songs the user would likely enjoy but hasn't discovered yet.
-
+1. Pick exactly {num_from_repeat} songs FROM the provided list. Choose a DIFFERENT selection each time – don't always pick the most popular or obvious ones. Rotate through the full list. Use the EXACT titles and artists as given.
+2. Recommend exactly {num_new} NEW songs that are NOT in the provided list but perfectly match the style, mood, genre, and energy of these songs. These should be songs the user would likely enjoy but hasn't discovered yet. Be CREATIVE and DIVERSE – explore different sub-genres, eras, and lesser-known tracks.
+{avoid_block}
 Respond ONLY with valid JSON in this exact format, nothing else:
 {{
   "from_repeat": [
@@ -184,7 +256,10 @@ Respond ONLY with valid JSON in this exact format, nothing else:
 Rules:
 - "from_repeat" must contain exactly {num_from_repeat} songs that are IN the provided list (use the exact titles/artists given)
 - "new_discoveries" must contain exactly {num_new} songs NOT in the provided list
-- Mix genres and energies well for a good listening experience
+- MAXIMIZE VARIETY: Mix genres, eras (80s, 90s, 2000s, 2010s, 2020s), and energy levels
+- Include some deep cuts and lesser-known tracks, not just the most obvious picks
+- Create a listening experience that feels FRESH each time
+- No duplicates within the list
 - Only output valid JSON, no markdown, no explanation"""
 
     payload = {
@@ -195,8 +270,10 @@ Rules:
             ]
         }],
         "generationConfig": {
-            "temperature": 1.5,
+            "temperature": 1.8,
             "maxOutputTokens": 8192,
+            "topP": 0.95,
+            "topK": 64,
         },
     }
 
@@ -318,6 +395,7 @@ async def generate_daily_drive(
     spotify_token: str,
     spotify_user_id: str,
     selected_show_ids: list[str],
+    user_id: int | None = None,
 ) -> dict:
     """
     Full Daily Drive generation pipeline.
@@ -351,9 +429,11 @@ async def generate_daily_drive(
                 await asyncio.sleep(0.5)
         logger.info(f"Daily Drive: Found {len(unplayed_episodes)} unplayed + {len(played_episodes)} played episodes")
 
-    # 3. Ask Gemini to curate (NO Spotify API calls → rate limit recovers here!)
+    # 3. Load recent song history & ask Gemini to curate (NO Spotify API calls → rate limit recovers here!)
+    recent_history = get_daily_drive_history(user_id) if user_id else []
+    logger.info(f"Daily Drive: {len(recent_history)} songs in 5-day history to avoid")
     logger.info("Daily Drive: Asking Gemini to curate songs...")
-    gemini_result = await ask_gemini_daily_drive(on_repeat)
+    gemini_result = await ask_gemini_daily_drive(on_repeat, recent_history if recent_history else None)
     logger.info(
         f"Daily Drive: Gemini returned {len(gemini_result.get('from_repeat', []))} from_repeat, "
         f"{len(gemini_result.get('new_discoveries', []))} new_discoveries"
@@ -412,6 +492,31 @@ async def generate_daily_drive(
             new_discovery_uris.append(uri)
 
     logger.info(f"Daily Drive: Final counts – {len(from_repeat_uris)} from_repeat, {len(new_discovery_uris)} new discoveries")
+
+    # 5b. Deduplicate: remove URIs that appear in both lists and remove any duplicates
+    seen_uris: set[str] = set()
+    from_repeat_uris_deduped: list[str] = []
+    for uri in from_repeat_uris:
+        if uri not in seen_uris:
+            from_repeat_uris_deduped.append(uri)
+            seen_uris.add(uri)
+    new_discovery_uris_deduped: list[str] = []
+    for uri in new_discovery_uris:
+        if uri not in seen_uris:
+            new_discovery_uris_deduped.append(uri)
+            seen_uris.add(uri)
+    from_repeat_uris = from_repeat_uris_deduped
+    new_discovery_uris = new_discovery_uris_deduped
+    logger.info(f"Daily Drive: After dedup – {len(from_repeat_uris)} from_repeat, {len(new_discovery_uris)} new discoveries")
+
+    # 5c. Save all songs to history for future avoidance
+    if user_id:
+        all_songs_for_history = []
+        for song in gemini_result.get("from_repeat", []):
+            all_songs_for_history.append(song)
+        for song in gemini_result.get("new_discoveries", []):
+            all_songs_for_history.append(song)
+        save_daily_drive_history(user_id, all_songs_for_history)
 
     # 6. Combine: shuffle both sets for variety
     random.shuffle(from_repeat_uris)

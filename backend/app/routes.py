@@ -541,7 +541,34 @@ async def generate_daily_drive_playlist(
             spotify_token=spotify_token,
             spotify_user_id=current_user.spotify_id,
             selected_show_ids=payload.selected_show_ids,
+            user_id=current_user.id,
         )
+
+        # Generate and upload AI cover image
+        playlist_id = result.get("playlist_id")
+        if playlist_id:
+            try:
+                cover_b64 = await generate_playlist_cover(
+                    playlist_name=result.get("playlist_name", "Daily Drive"),
+                    mood_summary="A personal daily mix of favorite songs, fresh discoveries, and podcasts for the commute",
+                    playlist_description=f"Daily Drive – {result.get('on_repeat_count', 0)} On-Repeat Songs, {result.get('new_discoveries_count', 0)} new discoveries",
+                )
+                if cover_b64:
+                    spotify_token = await get_valid_spotify_token(current_user, db)
+                    cover_uploaded = await upload_playlist_cover(
+                        playlist_id=playlist_id,
+                        image_base64=cover_b64,
+                        spotify_token=spotify_token,
+                    )
+                    if cover_uploaded:
+                        logger.info(f"[Daily Drive] AI cover uploaded for playlist {playlist_id}")
+                    else:
+                        logger.warning(f"[Daily Drive] Cover upload failed, using default")
+                else:
+                    logger.warning(f"[Daily Drive] Cover generation returned None")
+            except Exception as cover_err:
+                logger.warning(f"[Daily Drive] Cover generation failed (non-fatal): {cover_err}")
+
         return result
     except Exception as e:
         logger.error(f"Daily Drive generation failed: {e}", exc_info=True)
@@ -564,6 +591,33 @@ async def gym_playlist_generate(
             current_user=current_user,
             db=db,
         )
+
+        # Generate and upload AI cover image
+        playlist_id = result.get("playlist_id")
+        if playlist_id:
+            try:
+                spotify_token = await get_valid_spotify_token(current_user, db)
+                cover_b64 = await generate_playlist_cover(
+                    playlist_name=result.get("playlist_name", "Gym Mix"),
+                    mood_summary="High-energy workout playlist with motivating beats for the gym",
+                    playlist_description=f"Gym Power Mix – {result.get('total_tracks', 30)} motivating tracks",
+                )
+                if cover_b64:
+                    spotify_token = await get_valid_spotify_token(current_user, db)
+                    cover_uploaded = await upload_playlist_cover(
+                        playlist_id=playlist_id,
+                        image_base64=cover_b64,
+                        spotify_token=spotify_token,
+                    )
+                    if cover_uploaded:
+                        logger.info(f"[Gym Playlist] AI cover uploaded for playlist {playlist_id}")
+                    else:
+                        logger.warning(f"[Gym Playlist] Cover upload failed, using default")
+                else:
+                    logger.warning(f"[Gym Playlist] Cover generation returned None")
+            except Exception as cover_err:
+                logger.warning(f"[Gym Playlist] Cover generation failed (non-fatal): {cover_err}")
+
         return result
     except Exception as e:
         logger.error(f"Gym playlist generation failed: {e}", exc_info=True)
