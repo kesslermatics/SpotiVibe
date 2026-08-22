@@ -42,7 +42,8 @@ HISTORY_TTL = 5 * 24 * 60 * 60  # 5 days in seconds
 
 # Hilfsfunktion: Key für Song generieren
 def song_cache_key(title: str, artist: str) -> str:
-    return f"song_uri::{title.lower().strip()}|||{artist.lower().strip()}"
+    # v2: invalidate old cache entries that may have stored clean/non-explicit URIs
+    return f"song_uri_v2::{title.lower().strip()}|||{artist.lower().strip()}"
 
 
 def daily_drive_history_key(user_id: int) -> str:
@@ -308,10 +309,20 @@ Rules:
         raise Exception(f"Gemini returned invalid JSON: {e}")
 
 
+def _pick_best_track(items: list[dict]) -> dict | None:
+    """From a list of Spotify track items, prefer the explicit version."""
+    if not items:
+        return None
+    for track in items:
+        if track.get("explicit", False):
+            return track
+    return items[0]
+
+
 async def robust_spotify_search(query: str, spotify_token: str, max_retries: int = 3) -> dict | None:
-    """Spotify search with retry-after handling and 429 logging."""
+    """Spotify search with retry-after handling and 429 logging. Prefers explicit versions."""
     headers = {"Authorization": f"Bearer {spotify_token}"}
-    params = {"q": query, "type": "track", "limit": 1}
+    params = {"q": query, "type": "track", "limit": 10}
     for attempt in range(max_retries):
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -321,9 +332,9 @@ async def robust_spotify_search(query: str, spotify_token: str, max_retries: int
             )
         if resp.status_code == 200:
             items = resp.json().get("tracks", {}).get("items", [])
-            if not items:
+            track = _pick_best_track(items)
+            if not track:
                 return None
-            track = items[0]
             return {
                 "title": track["name"],
                 "artist": ", ".join(a["name"] for a in track["artists"]),
