@@ -26,6 +26,7 @@ interface GymPlaylistResult {
 interface GymSettings {
     auto_refresh: boolean;
     source_playlist_ids: string[];
+    include_on_repeat: boolean;
     last_spotify_playlist_id: string | null;
 }
 
@@ -39,6 +40,7 @@ export default function GymPlaylistPage({ onLogout: _onLogout }: { onLogout: () 
     const [playlists, setPlaylists] = useState<Playlist[]>([]);
     const [loadingPlaylists, setLoadingPlaylists] = useState(true);
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [includeOnRepeat, setIncludeOnRepeat] = useState(false);
     const [autoRefresh, setAutoRefresh] = useState(false);
     const [error, setError] = useState("");
     const [result, setResult] = useState<GymPlaylistResult | null>(null);
@@ -76,6 +78,7 @@ export default function GymPlaylistPage({ onLogout: _onLogout }: { onLogout: () 
                 setPlaylists(playlistData.playlists);
                 if (settingsData) {
                     setAutoRefresh(settingsData.auto_refresh);
+                    setIncludeOnRepeat(settingsData.include_on_repeat);
                     if (settingsData.source_playlist_ids.length > 0) {
                         setSelectedIds(new Set(settingsData.source_playlist_ids));
                     }
@@ -118,7 +121,10 @@ export default function GymPlaylistPage({ onLogout: _onLogout }: { onLogout: () 
         try {
             const data = await api<GymPlaylistResult>("/gym-playlist/generate", {
                 method: "POST",
-                body: { source_playlist_ids: Array.from(selectedIds) },
+                body: {
+                    source_playlist_ids: Array.from(selectedIds),
+                    include_on_repeat: includeOnRepeat,
+                },
                 token,
             });
             setResult(data);
@@ -201,6 +207,26 @@ export default function GymPlaylistPage({ onLogout: _onLogout }: { onLogout: () 
                             <h3 className="mb-3 text-sm font-semibold text-gray-300">
                                 🎵 Choose playlists as inspiration
                             </h3>
+
+                            <label className={`mb-3 flex cursor-pointer items-center gap-3 rounded-xl p-3 transition-all ${includeOnRepeat
+                                ? "bg-red-500/15 ring-1 ring-red-500/30"
+                                : "bg-white/5 ring-1 ring-white/10 hover:bg-white/10"
+                                }`}>
+                                <input
+                                    type="checkbox"
+                                    checked={includeOnRepeat}
+                                    onChange={(event) => setIncludeOnRepeat(event.target.checked)}
+                                    className="h-5 w-5 cursor-pointer accent-red-500"
+                                />
+                                <div className="min-w-0 flex-1">
+                                    <p className="text-sm font-medium text-gray-200">
+                                        🔁 Include your On Repeat songs
+                                    </p>
+                                    <p className="mt-0.5 text-xs text-gray-500">
+                                        Use your current top tracks alongside the selected playlists.
+                                    </p>
+                                </div>
+                            </label>
 
                             {loadingPlaylists ? (
                                 <div className="space-y-2">

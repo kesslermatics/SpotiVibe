@@ -26,6 +26,7 @@ from app.config import get_settings
 from app.database import SessionLocal
 from app.models import User, GymPlaylistSettings
 from app.auth import get_valid_spotify_token, refresh_spotify_token
+from app.daily_drive import fetch_on_repeat_tracks
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -81,6 +82,32 @@ def get_gym_history(user_id: int) -> list[str]:
     except Exception as e:
         logger.warning(f"Gym History: Could not read history: {e}")
         return []
+
+
+def parse_gym_sources(serialized_sources: str | None) -> tuple[list[str], bool]:
+    """Read legacy playlist lists and the current sources-plus-On-Repeat format."""
+    try:
+        value = json.loads(serialized_sources or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return [], False
+
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)], False
+    if isinstance(value, dict):
+        playlist_ids = value.get("playlist_ids", [])
+        return (
+            [item for item in playlist_ids if isinstance(item, str)],
+            bool(value.get("include_on_repeat", False)),
+        )
+    return [], False
+
+
+def serialize_gym_sources(source_playlist_ids: list[str], include_on_repeat: bool) -> str:
+    """Persist all gym inspiration choices without requiring a schema migration."""
+    return json.dumps({
+        "playlist_ids": source_playlist_ids,
+        "include_on_repeat": include_on_repeat,
+    })
 
 
 # ── Spotify helpers ───────────────────────────────────
@@ -378,17 +405,20 @@ async def generate_gym_playlist(
     source_playlist_ids: list[str],
     current_user: User,
     db: Session,
+    include_on_repeat: bool = False,
 ) -> dict:
     """
     Full gym playlist generation pipeline.
     """
     spotify_token = await get_valid_spotify_token(current_user, db)
 
-    # 1. Fetch tracks from all selected playlists
+    # 1. Fetch tracks from all selected playlists and, when chosen, the user's
+    # current top tracks as an additional taste signal.
     logger.info(
         f"Gym Playlist: Fetching tracks from {len(source_playlist_ids)} playlists..."
     )
     all_tracks: list[dict] = []
+    on_repeat_tracks: list[dict] = []
     skipped_playlists: list[str] = []
     for pid in source_playlist_ids:
         try:
@@ -406,6 +436,20 @@ async def generate_gym_playlist(
         if len(source_playlist_ids) > 1:
             await asyncio.sleep(0.3)
 
+    if include_on_repeat:
+        logger.info("Gym Playlist: Adding current On-Repeat tracks as inspiration...")
+        on_repeat_tracks = await fetch_on_repeat_tracks(spotify_token)
+        existing_uris = {track.get("uri") for track in all_tracks if track.get("uri")}
+        on_repeat_tracks = [
+            track for track in on_repeat_tracks
+            if not track.get("uri") or track["uri"] not in existing_uris
+        ]
+        all_tracks.extend(on_repeat_tracks)
+        logger.info(
+            "Gym Playlist: Added %s distinct On-Repeat tracks to the inspiration pool",
+            len(on_repeat_tracks),
+        )
+
     if skipped_playlists:
         logger.info(
             f"Gym Playlist: Skipped {len(skipped_playlists)}/{len(source_playlist_ids)} "
@@ -421,11 +465,28 @@ async def generate_gym_playlist(
 
     logger.info(f"Gym Playlist: Got {len(all_tracks)} total tracks")
 
-    # 2. Sample inspiration songs (up to 15)
+    # 2. Sample up to 15 inspiration songs. When enabled, reserve up to five
+    # spots for On Repeat so the checkbox has a real effect on the mix.
     sample_size = min(15, len(all_tracks))
-    sampled = random.sample(all_tracks, sample_size)
+    on_repeat_sample = random.sample(
+        on_repeat_tracks,
+        min(5, len(on_repeat_tracks), sample_size),
+    )
+    selected_uris = {track.get("uri") for track in on_repeat_sample if track.get("uri")}
+    remaining_pool = [
+        track for track in all_tracks
+        if not track.get("uri") or track["uri"] not in selected_uris
+    ]
+    sampled = on_repeat_sample + random.sample(
+        remaining_pool,
+        min(sample_size - len(on_repeat_sample), len(remaining_pool)),
+    )
     inspiration = [f"{t['title']} - {t['artist']}" for t in sampled]
-    logger.info(f"Gym Playlist: Using {len(inspiration)} inspiration songs")
+    logger.info(
+        "Gym Playlist: Using %s inspiration songs (%s from On Repeat)",
+        len(inspiration),
+        len(on_repeat_sample),
+    )
 
     # 3. Load recent song history & ask Gemini
     recent_history = get_gym_history(current_user.id)
@@ -551,13 +612,19 @@ async def generate_gym_playlist(
         if not gym_settings:
             gym_settings = GymPlaylistSettings(
                 user_id=current_user.id,
-                source_playlist_ids=json.dumps(source_playlist_ids),
+                source_playlist_ids=serialize_gym_sources(
+                    source_playlist_ids,
+                    include_on_repeat,
+                ),
                 last_spotify_playlist_id=playlist_id,
                 auto_refresh=False,
             )
             db.add(gym_settings)
         else:
-            gym_settings.source_playlist_ids = json.dumps(source_playlist_ids)
+            gym_settings.source_playlist_ids = serialize_gym_sources(
+                source_playlist_ids,
+                include_on_repeat,
+            )
             gym_settings.last_spotify_playlist_id = playlist_id
             auto_refresh_val = gym_settings.auto_refresh
 
@@ -606,7 +673,9 @@ async def auto_refresh_gym_playlists():
                     )
                     continue
 
-                source_ids = json.loads(gym_settings.source_playlist_ids or "[]")
+                source_ids, include_on_repeat = parse_gym_sources(
+                    gym_settings.source_playlist_ids
+                )
                 if not source_ids:
                     logger.warning(
                         f"Auto-Refresh: User {user.spotify_id} has no source playlists, skipping"
@@ -616,7 +685,12 @@ async def auto_refresh_gym_playlists():
                 logger.info(
                     f"Auto-Refresh: Generating gym playlist for user {user.spotify_id}..."
                 )
-                await generate_gym_playlist(source_ids, user, db)
+                await generate_gym_playlist(
+                    source_ids,
+                    user,
+                    db,
+                    include_on_repeat=include_on_repeat,
+                )
                 logger.info(f"Auto-Refresh: Success for user {user.spotify_id}")
 
                 await asyncio.sleep(5)

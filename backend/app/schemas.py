@@ -96,6 +96,7 @@ class DailyDriveResponse(BaseModel):
 # ── Gym Playlist ─────────────────────────────────────
 class GymPlaylistGenerateRequest(BaseModel):
     source_playlist_ids: list[str]
+    include_on_repeat: bool = False
 
 
 class GymPlaylistGenerateResponse(BaseModel):
@@ -110,6 +111,7 @@ class GymPlaylistGenerateResponse(BaseModel):
 class GymPlaylistSettingsResponse(BaseModel):
     auto_refresh: bool
     source_playlist_ids: list[str]
+    include_on_repeat: bool
     last_spotify_playlist_id: str | None
 
 

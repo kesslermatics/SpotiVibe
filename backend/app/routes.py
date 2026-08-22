@@ -14,7 +14,7 @@ from app.schemas import SpotifyCallback, Token, UserResponse, MessageResponse, D
 from app.auth import create_access_token, get_current_user, get_valid_spotify_token, refresh_spotify_token
 from app.discover import discover_songs
 from app.daily_drive import fetch_saved_shows, generate_daily_drive, fetch_on_repeat_tracks
-from app.gym_playlist import generate_gym_playlist
+from app.gym_playlist import generate_gym_playlist, parse_gym_sources
 from app.roast import generate_vibe_roast
 from app.cover_gen import generate_playlist_cover, upload_playlist_cover
 from app.models import GymPlaylistSettings
@@ -591,6 +591,7 @@ async def gym_playlist_generate(
     try:
         result = await generate_gym_playlist(
             source_playlist_ids=payload.source_playlist_ids,
+            include_on_repeat=payload.include_on_repeat,
             current_user=current_user,
             db=db,
         )
@@ -650,11 +651,16 @@ def gym_playlist_get_settings(
         return {
             "auto_refresh": False,
             "source_playlist_ids": [],
+            "include_on_repeat": False,
             "last_spotify_playlist_id": None,
         }
+    source_playlist_ids, include_on_repeat = parse_gym_sources(
+        gym_settings.source_playlist_ids
+    )
     return {
         "auto_refresh": gym_settings.auto_refresh,
-        "source_playlist_ids": json.loads(gym_settings.source_playlist_ids or "[]"),
+        "source_playlist_ids": source_playlist_ids,
+        "include_on_repeat": include_on_repeat,
         "last_spotify_playlist_id": gym_settings.last_spotify_playlist_id,
     }
 
