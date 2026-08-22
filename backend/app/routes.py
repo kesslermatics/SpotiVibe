@@ -541,6 +541,9 @@ async def generate_daily_drive_playlist(
             spotify_token=spotify_token,
             spotify_user_id=current_user.spotify_id,
             selected_show_ids=payload.selected_show_ids,
+            duration_minutes=payload.duration_minutes,
+            day_mode=payload.day_mode,
+            familiarity=payload.familiarity,
             user_id=current_user.id,
         )
 
@@ -599,8 +602,8 @@ async def gym_playlist_generate(
                 spotify_token = await get_valid_spotify_token(current_user, db)
                 cover_b64 = await generate_playlist_cover(
                     playlist_name=result.get("playlist_name", "Gym Mix"),
-                    mood_summary="High-energy workout playlist with motivating beats for the gym",
-                    playlist_description=f"Gym Power Mix – {result.get('total_tracks', 30)} motivating tracks",
+                    mood_summary="Powerful energy, adrenaline, fire, neon lights, bold colors, electric atmosphere, abstract geometric power shapes",
+                    playlist_description="An explosive mix of motivating tracks – pure energy and power vibes",
                 )
                 if cover_b64:
                     spotify_token = await get_valid_spotify_token(current_user, db)
@@ -698,7 +701,7 @@ SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 
 SWIPE_GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.1-pro-preview:generateContent?key={settings.gemini_api_key}"
+    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
 )
 
 import redis as _redis

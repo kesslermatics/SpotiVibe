@@ -1,4 +1,6 @@
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 
 # ── Auth ──────────────────────────────────────────────
@@ -76,6 +78,9 @@ class SaveTracksResponse(BaseModel):
 # ── Daily Drive ───────────────────────────────────────
 class DailyDriveRequest(BaseModel):
     selected_show_ids: list[str] = []  # Spotify show IDs the user picked
+    duration_minutes: int = Field(default=60, ge=20, le=240)
+    day_mode: Literal["morning", "normal", "night_drive"] = "normal"
+    familiarity: int = Field(default=50, ge=0, le=100)  # 0 = familiar, 100 = discoveries
 
 
 class DailyDriveResponse(BaseModel):

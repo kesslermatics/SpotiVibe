@@ -9,13 +9,13 @@ settings = get_settings()
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.1-pro-preview:generateContent?key={settings.gemini_api_key}"
+    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
 )
 
 # Fast model for QA validation
 GEMINI_FLASH_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.1-pro-preview:generateContent?key={settings.gemini_api_key}"
+    f"gemini-3.6-flashh:generateContent?key={settings.gemini_api_key}"
 )
 
 SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
@@ -142,12 +142,22 @@ async def ask_gemini(
         raise Exception(f"Invalid JSON from Gemini: {e}")
 
 
+def _pick_best_track(items: list[dict]) -> dict | None:
+    """From a list of Spotify track items, prefer the explicit version."""
+    if not items:
+        return None
+    for track in items:
+        if track.get("explicit", False):
+            return track
+    return items[0]
+
+
 async def search_spotify(query: str, spotify_token: str) -> dict | None:
-    """Search Spotify for a track and return the first result."""
+    """Search Spotify for a track. Prefers explicit versions."""
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             SPOTIFY_SEARCH_URL,
-            params={"q": query, "type": "track", "limit": 1},
+            params={"q": query, "type": "track", "limit": 10},
             headers={"Authorization": f"Bearer {spotify_token}"},
         )
 
@@ -156,10 +166,10 @@ async def search_spotify(query: str, spotify_token: str) -> dict | None:
         return None
 
     items = resp.json().get("tracks", {}).get("items", [])
-    if not items:
+    track = _pick_best_track(items)
+    if not track:
         return None
 
-    track = items[0]
     album_images = track.get("album", {}).get("images", [])
 
     return {

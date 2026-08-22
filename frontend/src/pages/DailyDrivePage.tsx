@@ -25,6 +25,10 @@ interface DailyDriveResult {
 }
 
 type Step = "select" | "generating" | "done";
+type DailyDriveMode = "morning" | "normal" | "night_drive";
+
+const formatDuration = (minutes: number) =>
+    minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ""}`;
 
 export default function DailyDrivePage({ onLogout: _onLogout }: { onLogout: () => void }) {
     const navigate = useNavigate();
@@ -37,6 +41,9 @@ export default function DailyDrivePage({ onLogout: _onLogout }: { onLogout: () =
     const [error, setError] = useState("");
     const [result, setResult] = useState<DailyDriveResult | null>(null);
     const [generatingStep, setGeneratingStep] = useState(0);
+    const [durationMinutes, setDurationMinutes] = useState(60);
+    const [dayMode, setDayMode] = useState<DailyDriveMode>("normal");
+    const [familiarity, setFamiliarity] = useState(50);
 
     const generatingSteps = [
         { emoji: "🎧", text: "Loading your on-repeat songs..." },
@@ -89,7 +96,12 @@ export default function DailyDrivePage({ onLogout: _onLogout }: { onLogout: () =
         try {
             const data = await api<DailyDriveResult>("/daily-drive/generate", {
                 method: "POST",
-                body: { selected_show_ids: Array.from(selectedShowIds) },
+                body: {
+                    selected_show_ids: Array.from(selectedShowIds),
+                    duration_minutes: durationMinutes,
+                    day_mode: dayMode,
+                    familiarity,
+                },
                 token: token || "",
             });
             setResult(data);
@@ -165,6 +177,77 @@ export default function DailyDrivePage({ onLogout: _onLogout }: { onLogout: () =
                                     Finished playlist is saved to your Spotify
                                 </li>
                             </ul>
+                        </div>
+
+                        {/* Daily Drive settings */}
+                        <div className="mb-6 space-y-5 rounded-2xl bg-white/5 p-5 ring-1 ring-white/10">
+                            <div>
+                                <div className="mb-2 flex items-center justify-between">
+                                    <h3 className="text-sm font-semibold text-gray-300">⏱️ Drive length</h3>
+                                    <span className="rounded-full bg-orange-500/15 px-2.5 py-1 text-xs font-semibold text-orange-300">
+                                        {formatDuration(durationMinutes)}
+                                    </span>
+                                </div>
+                                <input
+                                    type="range"
+                                    min="20"
+                                    max="240"
+                                    step="10"
+                                    value={durationMinutes}
+                                    onChange={(event) => setDurationMinutes(Number(event.target.value))}
+                                    className="h-2 w-full cursor-pointer accent-orange-500"
+                                    aria-label="Drive length"
+                                />
+                                <div className="mt-1 flex justify-between text-[11px] text-gray-500">
+                                    <span>20 min</span>
+                                    <span>4 h</span>
+                                </div>
+                            </div>
+
+                            <div>
+                                <h3 className="mb-2 text-sm font-semibold text-gray-300">🌤️ Day mode</h3>
+                                <div className="grid grid-cols-3 gap-2">
+                                    {([
+                                        ["morning", "☀️", "Morning"],
+                                        ["normal", "🚗", "Normal"],
+                                        ["night_drive", "🌙", "Night drive"],
+                                    ] as const).map(([mode, emoji, label]) => (
+                                        <button
+                                            key={mode}
+                                            type="button"
+                                            onClick={() => setDayMode(mode)}
+                                            className={`rounded-xl px-2 py-3 text-xs font-medium transition ${dayMode === mode
+                                                ? "bg-orange-500/20 text-orange-200 ring-1 ring-orange-500/40"
+                                                : "bg-white/5 text-gray-400 hover:bg-white/10 hover:text-gray-200"
+                                                }`}
+                                        >
+                                            <span className="mb-1 block text-base">{emoji}</span>
+                                            {label}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div>
+                                <div className="mb-2 flex items-center justify-between">
+                                    <h3 className="text-sm font-semibold text-gray-300">✨ Familiar or new?</h3>
+                                    <span className="text-xs font-medium text-orange-300">{familiarity}% new</span>
+                                </div>
+                                <input
+                                    type="range"
+                                    min="0"
+                                    max="100"
+                                    step="10"
+                                    value={familiarity}
+                                    onChange={(event) => setFamiliarity(Number(event.target.value))}
+                                    className="h-2 w-full cursor-pointer accent-orange-500"
+                                    aria-label="Balance between familiar songs and discoveries"
+                                />
+                                <div className="mt-1 flex justify-between text-[11px] text-gray-500">
+                                    <span>More familiar</span>
+                                    <span>More discoveries</span>
+                                </div>
+                            </div>
                         </div>
 
                         {/* Podcast selection */}

@@ -30,7 +30,7 @@ SPOTIFY_API = "https://api.spotify.com/v1"
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.1-pro-preview:generateContent?key={settings.gemini_api_key}"
+    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
 )
 
 # Redis Client initialisieren
@@ -42,7 +42,8 @@ HISTORY_TTL = 5 * 24 * 60 * 60  # 5 days in seconds
 
 # Hilfsfunktion: Key für Song generieren
 def song_cache_key(title: str, artist: str) -> str:
-    return f"song_uri::{title.lower().strip()}|||{artist.lower().strip()}"
+    # v2: invalidate old cache entries that may have stored clean/non-explicit URIs
+    return f"song_uri_v2::{title.lower().strip()}|||{artist.lower().strip()}"
 
 
 def daily_drive_history_key(user_id: int) -> str:
@@ -207,15 +208,29 @@ async def fetch_show_episodes(show_id: str, spotify_token: str, limit: int = 50)
     return episodes
 
 
-async def ask_gemini_daily_drive(on_repeat_songs: list[dict], recent_history: list[str] | None = None) -> dict:
-    """Ask Gemini to curate the Daily Drive song selection.
-    If recent_history is provided, Gemini will avoid those songs for better variation."""
+async def ask_gemini_daily_drive(
+    on_repeat_songs: list[dict],
+    duration_minutes: int,
+    day_mode: str,
+    familiarity: int,
+    recent_history: list[str] | None = None,
+) -> dict:
+    """Curate a Daily Drive for the requested duration, moment, and discovery level."""
     song_list = "\n".join(
         f"- {s['title']} – {s['artist']}" for s in on_repeat_songs
     )
 
-    num_from_repeat = min(20, len(on_repeat_songs))
-    num_new = 20
+    # A typical song is around 3.5 minutes. Podcasts remain interleaved exactly
+    # as before, while the slider controls the amount of music around them.
+    target_song_count = max(6, min(70, round(duration_minutes / 3.5)))
+    num_new = round(target_song_count * familiarity / 100)
+    num_from_repeat = target_song_count - num_new
+
+    mode_guidance = {
+        "morning": "Create an uplifting, clear-headed start: positive momentum, daylight energy, and no jarring opening.",
+        "normal": "Create a natural, versatile drive: engaging, varied, and easy to live with at any point in the day.",
+        "night_drive": "Create a cinematic, immersive night-drive atmosphere: flowing, confident, and slightly more atmospheric without losing momentum.",
+    }[day_mode]
 
     # Build avoidance block from history
     avoid_block = ""
@@ -240,6 +255,10 @@ I will give you a list of songs that the user currently has on repeat (their fav
 Your task:
 1. Pick exactly {num_from_repeat} songs FROM the provided list. Choose a DIFFERENT selection each time – don't always pick the most popular or obvious ones. Rotate through the full list. Use the EXACT titles and artists as given.
 2. Recommend exactly {num_new} NEW songs that are NOT in the provided list but perfectly match the style, mood, genre, and energy of these songs. These should be songs the user would likely enjoy but hasn't discovered yet. Be CREATIVE and DIVERSE – explore different sub-genres, eras, and lesser-known tracks.
+
+This Daily Drive is for approximately {duration_minutes} minutes of music around the podcast placements.
+Day mode: {day_mode}. {mode_guidance}
+Discovery setting: {familiarity}% new. Honour this exactly: the requested balance is {num_from_repeat} familiar songs and {num_new} new discoveries.
 {avoid_block}
 Respond ONLY with valid JSON in this exact format, nothing else:
 {{
@@ -308,10 +327,20 @@ Rules:
         raise Exception(f"Gemini returned invalid JSON: {e}")
 
 
+def _pick_best_track(items: list[dict]) -> dict | None:
+    """From a list of Spotify track items, prefer the explicit version."""
+    if not items:
+        return None
+    for track in items:
+        if track.get("explicit", False):
+            return track
+    return items[0]
+
+
 async def robust_spotify_search(query: str, spotify_token: str, max_retries: int = 3) -> dict | None:
-    """Spotify search with retry-after handling and 429 logging."""
+    """Spotify search with retry-after handling and 429 logging. Prefers explicit versions."""
     headers = {"Authorization": f"Bearer {spotify_token}"}
-    params = {"q": query, "type": "track", "limit": 1}
+    params = {"q": query, "type": "track", "limit": 10}
     for attempt in range(max_retries):
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -321,9 +350,9 @@ async def robust_spotify_search(query: str, spotify_token: str, max_retries: int
             )
         if resp.status_code == 200:
             items = resp.json().get("tracks", {}).get("items", [])
-            if not items:
+            track = _pick_best_track(items)
+            if not track:
                 return None
-            track = items[0]
             return {
                 "title": track["name"],
                 "artist": ", ".join(a["name"] for a in track["artists"]),
@@ -395,6 +424,9 @@ async def generate_daily_drive(
     spotify_token: str,
     spotify_user_id: str,
     selected_show_ids: list[str],
+    duration_minutes: int,
+    day_mode: str,
+    familiarity: int,
     user_id: int | None = None,
 ) -> dict:
     """
@@ -433,7 +465,13 @@ async def generate_daily_drive(
     recent_history = get_daily_drive_history(user_id) if user_id else []
     logger.info(f"Daily Drive: {len(recent_history)} songs in 5-day history to avoid")
     logger.info("Daily Drive: Asking Gemini to curate songs...")
-    gemini_result = await ask_gemini_daily_drive(on_repeat, recent_history if recent_history else None)
+    gemini_result = await ask_gemini_daily_drive(
+        on_repeat,
+        duration_minutes=duration_minutes,
+        day_mode=day_mode,
+        familiarity=familiarity,
+        recent_history=recent_history if recent_history else None,
+    )
     logger.info(
         f"Daily Drive: Gemini returned {len(gemini_result.get('from_repeat', []))} from_repeat, "
         f"{len(gemini_result.get('new_discoveries', []))} new_discoveries"

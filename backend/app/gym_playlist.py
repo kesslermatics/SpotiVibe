@@ -34,7 +34,7 @@ SPOTIFY_API = "https://api.spotify.com/v1"
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.1-pro-preview:generateContent?key={settings.gemini_api_key}"
+    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
 )
 
 # Redis Client
@@ -45,7 +45,8 @@ HISTORY_TTL = 2 * 24 * 60 * 60  # 2 days in seconds
 
 
 def song_cache_key(title: str, artist: str) -> str:
-    return f"song_uri::{title.lower().strip()}|||{artist.lower().strip()}"
+    # v2: invalidate old cache entries that may have stored clean/non-explicit URIs
+    return f"song_uri_v2::{title.lower().strip()}|||{artist.lower().strip()}"
 
 
 def gym_history_key(user_id: int) -> str:
@@ -171,12 +172,24 @@ async def fetch_playlist_tracks(
     return tracks, current_token
 
 
+def _pick_best_track(items: list[dict]) -> dict | None:
+    """From a list of Spotify track items, prefer the explicit version."""
+    if not items:
+        return None
+    # Prefer explicit tracks
+    for track in items:
+        if track.get("explicit", False):
+            return track
+    # Fallback to first result if no explicit version found
+    return items[0]
+
+
 async def robust_spotify_search(
     query: str, spotify_token: str, max_retries: int = 3
 ) -> dict | None:
-    """Spotify search with retry-after handling."""
+    """Spotify search with retry-after handling. Prefers explicit versions."""
     headers = {"Authorization": f"Bearer {spotify_token}"}
-    params = {"q": query, "type": "track", "limit": 1}
+    params = {"q": query, "type": "track", "limit": 10}
 
     for attempt in range(max_retries):
         async with httpx.AsyncClient() as client:
@@ -185,9 +198,9 @@ async def robust_spotify_search(
             )
         if resp.status_code == 200:
             items = resp.json().get("tracks", {}).get("items", [])
-            if not items:
+            track = _pick_best_track(items)
+            if not track:
                 return None
-            track = items[0]
             return {
                 "title": track["name"],
                 "artist": ", ".join(a["name"] for a in track["artists"]),
@@ -277,8 +290,7 @@ async def robust_add_items(
 
 
 async def ask_gemini_gym(inspiration_songs: list[str], recent_history: list[str] | None = None) -> dict:
-    """Ask Gemini for a gym playlist based on inspiration songs.
-    If recent_history is provided, Gemini will avoid those songs."""
+    """Create a varied, ordered workout soundtrack from the user's music taste."""
     song_list = "\n".join(f"- {s}" for s in inspiration_songs)
 
     avoid_block = ""
@@ -288,50 +300,47 @@ async def ask_gemini_gym(inspiration_songs: list[str], recent_history: list[str]
 DO NOT include ANY of these songs. Pick DIFFERENT songs instead:
 {avoid_list}\n"""
 
-    prompt = f"""You are a music expert creating personalized gym playlists.
+    prompt = f"""You are a music curator creating a personal gym soundtrack.
 
-I will give you a list of songs that represent the user's ACTUAL music taste.
+The inspiration songs represent the user's ACTUAL and diverse music taste. A great gym playlist is not just maximum intensity: it should feel like a varied, motivating journey that still sounds like this person.
 
-CRITICAL: The user's taste is DIVERSE. Analyze the genres in their inspiration songs carefully.
-If they listen to 60% Rock, 20% Pop, 20% Hip-Hop – your playlist should reflect similar proportions!
-Do NOT convert everything into one genre (like hard metal). PRESERVE their genre diversity.
+First, infer the user's broad genre balance from the inspiration songs. Preserve that balance in the recommendations. Never let one broad genre or closely related sound dominate more than one third of the 30 tracks. Include songs with drive, emotional lift, rhythm, confidence, or momentum even when they are not the most aggressive or highest-BPM choice.
 
-Your task: Create an energizing workout playlist with exactly 30 songs that:
-- MATCH the user's actual genre distribution from the inspiration songs
-- Pick energetic/upbeat songs FROM EACH GENRE the user likes (not just rock/metal)
-- For Pop → pick danceable, high-BPM pop tracks  
-- For Hip-Hop → pick hype, motivating rap tracks
-- For Rock → pick energetic rock (but NOT just metal!)
-- For Electronic → pick driving EDM/dance tracks
-- Etc. for any other genres present
-- Avoid slow ballads, but don't interpret "workout" as "must be metal"
-- Mix well-known tracks with some discoveries
-- Create variety – avoid 30 songs that sound identical
+Create the playlist in this exact listening order:
+- Warm-up (5 tracks): motivating and engaging, with room to ease into the workout.
+- Main set (15 tracks): the user's strongest personal workout sound; varied, confident, and steadily energising.
+- Peak (6 tracks): the most intense, forceful songs for hard sets or cardio, but still grounded in the user's taste.
+- Finish (4 tracks): uplifting, satisfying, and euphoric rather than relentlessly aggressive.
 
-DO NOT include any of the inspiration songs in your recommendations.
+Across every phase:
+- Match the user's real genre diversity rather than collapsing into one high-energy genre.
+- Do not use more than 10 tracks from any broad genre or very closely related sound.
+- Do not place three songs with the same or very similar sonic character in a row.
+- Alternate texture, intensity, and genre naturally while keeping the workout momentum.
+- Avoid slow ballads, but do not assume workout music must be extreme, heavy, or electronic.
+- Mix recognisable favourites in spirit with worthwhile discoveries.
+- Do not include any inspiration song itself and do not use duplicates.
 {avoid_block}
 Respond ONLY with valid JSON in this exact format:
 {{
-  "songs": [
-    {{"title": "Song Name", "artist": "Artist Name"}},
-    ...
-  ]
+  "warm_up": [{{"title": "Song Name", "artist": "Artist Name"}}],
+  "main_set": [{{"title": "Song Name", "artist": "Artist Name"}}],
+  "peak": [{{"title": "Song Name", "artist": "Artist Name"}}],
+  "finish": [{{"title": "Song Name", "artist": "Artist Name"}}]
 }}
 
 Rules:
-- Exactly 30 songs
-- No duplicates  
-- Reflect the user's genre mix, not just one style
-- Energetic tracks from EACH genre they like
-- Only output valid JSON, no markdown, no explanation
+- Return exactly 5 warm_up tracks, 15 main_set tracks, 6 peak tracks, and 4 finish tracks.
+- Keep each array in the exact order it should play.
+- Only output valid JSON, no markdown, no explanation.
 
-Here are the user's inspiration songs (analyze genres carefully):
+Here are the user's inspiration songs:
 {song_list}"""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 1.0,
+            "temperature": 0.9,
             "maxOutputTokens": 8192,
         },
     }
@@ -424,8 +433,16 @@ async def generate_gym_playlist(
 
     logger.info("Gym Playlist: Asking Gemini for recommendations...")
     gemini_result = await ask_gemini_gym(inspiration, recent_history if recent_history else None)
-    gemini_songs = gemini_result.get("songs", [])
-    logger.info(f"Gym Playlist: Gemini returned {len(gemini_songs)} songs")
+    workout_phases = ("warm_up", "main_set", "peak", "finish")
+    gemini_songs = [
+        song
+        for phase in workout_phases
+        for song in gemini_result.get(phase, [])
+    ]
+    logger.info(
+        "Gym Playlist: Gemini returned %s tracks across warm-up, main set, peak, and finish",
+        len(gemini_songs),
+    )
 
     # 4. Search each song on Spotify (sequential with delay)
     logger.info("Gym Playlist: Searching songs on Spotify...")

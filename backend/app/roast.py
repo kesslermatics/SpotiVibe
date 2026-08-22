@@ -25,7 +25,7 @@ SPOTIFY_API = "https://api.spotify.com/v1"
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.1-pro-preview:generateContent?key={settings.gemini_api_key}"
+    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
 )
 
 
