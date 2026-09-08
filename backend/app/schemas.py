@@ -105,6 +105,7 @@ class GymPlaylistGenerateResponse(BaseModel):
     playlist_name: str
     total_tracks: int
     inspiration_count: int
+    new_discoveries_count: int
     auto_refresh: bool
 
 

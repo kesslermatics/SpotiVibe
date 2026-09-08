@@ -20,6 +20,7 @@ interface GymPlaylistResult {
     playlist_name: string;
     total_tracks: number;
     inspiration_count: number;
+    new_discoveries_count: number;
     auto_refresh: boolean;
 }
 
@@ -189,7 +190,7 @@ export default function GymPlaylistPage({ onLogout: _onLogout }: { onLogout: () 
                                 </li>
                                 <li className="flex items-start gap-2">
                                     <span className="mt-0.5 text-red-400">🤖</span>
-                                    AI creates 30 high-energy gym tracks matching your style
+                                    AI creates 40 personal gym tracks, staying close to your current taste
                                 </li>
                                 <li className="flex items-start gap-2">
                                     <span className="mt-0.5 text-red-400">🔄</span>
@@ -421,12 +422,18 @@ export default function GymPlaylistPage({ onLogout: _onLogout }: { onLogout: () 
                         </p>
 
                         {/* Stats */}
-                        <div className="mb-8 grid w-full max-w-sm grid-cols-2 gap-3">
+                        <div className="mb-8 grid w-full max-w-sm grid-cols-3 gap-3">
                             <div className="rounded-xl bg-red-500/10 p-4 text-center ring-1 ring-red-500/20">
                                 <p className="text-2xl font-bold text-red-400">
                                     {result.total_tracks}
                                 </p>
                                 <p className="mt-1 text-[10px] text-gray-400">Tracks</p>
+                            </div>
+                            <div className="rounded-xl bg-purple-500/10 p-4 text-center ring-1 ring-purple-500/20">
+                                <p className="text-2xl font-bold text-purple-400">
+                                    {result.new_discoveries_count}
+                                </p>
+                                <p className="mt-1 text-[10px] text-gray-400">New gym tracks</p>
                             </div>
                             <div className="rounded-xl bg-orange-500/10 p-4 text-center ring-1 ring-orange-500/20">
                                 <p className="text-2xl font-bold text-orange-400">

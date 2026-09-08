@@ -4,8 +4,8 @@ Gym Playlist generator – personalized workout playlist.
 Flow:
 1. User selects source playlists as inspiration
 2. Fetch tracks from those playlists
-3. Sample up to 15 inspiration tracks
-4. Ask Gemini to generate 30 high-energy gym songs based on the user's taste
+3. Build 7 On-Repeat and 7 selected-playlist inspiration tracks when enabled
+4. Ask Gemini to generate 40 close-to-taste gym songs in workout phases
 5. Search each song on Spotify (with Redis cache)
 6. Delete old gym playlist if it exists
 7. Create a new Spotify playlist with a unique date-based name
@@ -317,36 +317,37 @@ async def robust_add_items(
 
 
 async def ask_gemini_gym(inspiration_songs: list[str], recent_history: list[str] | None = None) -> dict:
-    """Create a varied, ordered workout soundtrack from the user's music taste."""
+    """Create a close-to-taste, ordered 40-track workout soundtrack."""
     song_list = "\n".join(f"- {s}" for s in inspiration_songs)
 
     avoid_block = ""
     if recent_history:
         avoid_list = "\n".join(f"- {s}" for s in recent_history)
-        avoid_block = f"""\n\nIMPORTANT: The following songs were already used in recent gym playlists (last 2 days).
-DO NOT include ANY of these songs. Pick DIFFERENT songs instead:
+        avoid_block = f"""\n\nIMPORTANT: The following songs were used in recent gym playlists (last 2 days).
+Do not include any of them. Choose different songs instead:
 {avoid_list}\n"""
 
-    prompt = f"""You are a music curator creating a personal gym soundtrack.
+    prompt = f"""You are creating a personal 40-track gym playlist for this specific user.
 
-The inspiration songs represent the user's ACTUAL and diverse music taste. A great gym playlist is not just maximum intensity: it should feel like a varied, motivating journey that still sounds like this person.
+This is not a generic workout playlist and it is not a request to represent every genre.
+The user's current On Repeat songs are the strongest signal of what they actually want to hear right now. The selected playlist songs are a secondary signal. Stay close to the shared sound, artists, mood, and emotional character of those sources.
 
-First, infer the user's broad genre balance from the inspiration songs. Preserve that balance in the recommendations. Never let one broad genre or closely related sound dominate more than one third of the 30 tracks. Include songs with drive, emotional lift, rhythm, confidence, or momentum even when they are not the most aggressive or highest-BPM choice.
+The inspiration list marks its sources with [ON REPEAT] and [SELECTED PLAYLIST]. When both are present, treat the 7 [ON REPEAT] songs as the primary anchor and the 7 [SELECTED PLAYLIST] songs as supporting context.
 
-Create the playlist in this exact listening order:
-- Warm-up (5 tracks): motivating and engaging, with room to ease into the workout.
-- Main set (15 tracks): the user's strongest personal workout sound; varied, confident, and steadily energising.
-- Peak (6 tracks): the most intense, forceful songs for hard sets or cardio, but still grounded in the user's taste.
-- Finish (4 tracks): uplifting, satisfying, and euphoric rather than relentlessly aggressive.
+Recommendation balance:
+- About 30 of the 40 tracks (roughly 70–80%) must be safe, highly plausible matches: similar artists, nearby songs by artists the user likes, matching moods, or tracks with a very similar sound.
+- About 10 tracks may be controlled surprises, but they must still share the same overall vibe. Use adjacent sounds, related artists, or well-known songs the user may have forgotten — never random genre jumps.
+- Do not force every genre from the sources into the playlist. A genre that appears only incidentally should not suddenly dominate the result.
+- Gym suitability matters: choose songs with momentum, rhythm, confidence, emotional lift, or a motivating arc. Workout music does not have to mean the most aggressive, fastest, hardest, or most electronic option.
+- Do not include any inspiration song itself, do not use duplicates, and avoid songs from the recent-history block.
 
-Across every phase:
-- Match the user's real genre diversity rather than collapsing into one high-energy genre.
-- Do not use more than 10 tracks from any broad genre or very closely related sound.
-- Do not place three songs with the same or very similar sonic character in a row.
-- Alternate texture, intensity, and genre naturally while keeping the workout momentum.
-- Avoid slow ballads, but do not assume workout music must be extreme, heavy, or electronic.
-- Mix recognisable favourites in spirit with worthwhile discoveries.
-- Do not include any inspiration song itself and do not use duplicates.
+Create the playlist in this exact workout order:
+- Warm-up (6 tracks): motivating and engaging, gradually building without starting at maximum intensity.
+- Main set (20 tracks): the user's strongest personal sound, with steady drive and tasteful variation.
+- Peak (8 tracks): the most powerful moments for hard sets or cardio, still clearly grounded in the user's taste.
+- Finish (6 tracks): uplifting, satisfying, and euphoric rather than relentlessly aggressive.
+
+Across the order, vary intensity and texture naturally, but do not use three songs with the same or extremely similar sonic character in a row. This is about flow within the user's taste, not forced genre diversity.
 {avoid_block}
 Respond ONLY with valid JSON in this exact format:
 {{
@@ -357,8 +358,9 @@ Respond ONLY with valid JSON in this exact format:
 }}
 
 Rules:
-- Return exactly 5 warm_up tracks, 15 main_set tracks, 6 peak tracks, and 4 finish tracks.
+- Return exactly 6 warm_up tracks, 20 main_set tracks, 8 peak tracks, and 6 finish tracks: exactly 40 total.
 - Keep each array in the exact order it should play.
+- Prioritize the [ON REPEAT] taste signal over broad genre variety.
 - Only output valid JSON, no markdown, no explanation.
 
 Here are the user's inspiration songs:
@@ -412,8 +414,7 @@ async def generate_gym_playlist(
     """
     spotify_token = await get_valid_spotify_token(current_user, db)
 
-    # 1. Fetch tracks from all selected playlists and, when chosen, the user's
-    # current top tracks as an additional taste signal.
+    # 1. Fetch tracks from all selected playlists first.
     logger.info(
         f"Gym Playlist: Fetching tracks from {len(source_playlist_ids)} playlists..."
     )
@@ -436,17 +437,14 @@ async def generate_gym_playlist(
         if len(source_playlist_ids) > 1:
             await asyncio.sleep(0.3)
 
+    # 2. Build the exact inspiration balance. With On Repeat enabled, use up
+    # to seven current top tracks and seven selected-playlist tracks.
+    playlist_tracks = list(all_tracks)
     if include_on_repeat:
-        logger.info("Gym Playlist: Adding current On-Repeat tracks as inspiration...")
+        logger.info("Gym Playlist: Loading current On-Repeat tracks as the primary taste signal...")
         on_repeat_tracks = await fetch_on_repeat_tracks(spotify_token)
-        existing_uris = {track.get("uri") for track in all_tracks if track.get("uri")}
-        on_repeat_tracks = [
-            track for track in on_repeat_tracks
-            if not track.get("uri") or track["uri"] not in existing_uris
-        ]
-        all_tracks.extend(on_repeat_tracks)
         logger.info(
-            "Gym Playlist: Added %s distinct On-Repeat tracks to the inspiration pool",
+            "Gym Playlist: Found %s current On-Repeat tracks",
             len(on_repeat_tracks),
         )
 
@@ -456,36 +454,46 @@ async def generate_gym_playlist(
             f"playlists (403/inaccessible): {skipped_playlists}"
         )
 
-    if len(all_tracks) < 5:
+    if len(playlist_tracks) < 5 and not on_repeat_tracks:
         raise Exception(
             "Too few songs in the selected playlists. "
             "Some playlists could not be loaded (e.g. Spotify-generated ones like 'Discover Weekly'). "
             "Choose other playlists with more of your own songs!"
         )
 
-    logger.info(f"Gym Playlist: Got {len(all_tracks)} total tracks")
+    if include_on_repeat:
+        on_repeat_sample = random.sample(
+            on_repeat_tracks,
+            min(7, len(on_repeat_tracks)),
+        )
+        selected_uris = {track.get("uri") for track in on_repeat_sample if track.get("uri")}
+        remaining_playlist_tracks = [
+            track for track in playlist_tracks
+            if not track.get("uri") or track["uri"] not in selected_uris
+        ]
+        playlist_sample = random.sample(
+            remaining_playlist_tracks,
+            min(7, len(remaining_playlist_tracks)),
+        )
+        sampled = on_repeat_sample + playlist_sample
+        inspiration = (
+            [f"[ON REPEAT] {t['title']} - {t['artist']}" for t in on_repeat_sample]
+            + [f"[SELECTED PLAYLIST] {t['title']} - {t['artist']}" for t in playlist_sample]
+        )
+    else:
+        playlist_sample = random.sample(playlist_tracks, min(14, len(playlist_tracks)))
+        on_repeat_sample = []
+        sampled = playlist_sample
+        inspiration = [
+            f"[SELECTED PLAYLIST] {t['title']} - {t['artist']}"
+            for t in playlist_sample
+        ]
 
-    # 2. Sample up to 15 inspiration songs. When enabled, reserve up to five
-    # spots for On Repeat so the checkbox has a real effect on the mix.
-    sample_size = min(15, len(all_tracks))
-    on_repeat_sample = random.sample(
-        on_repeat_tracks,
-        min(5, len(on_repeat_tracks), sample_size),
-    )
-    selected_uris = {track.get("uri") for track in on_repeat_sample if track.get("uri")}
-    remaining_pool = [
-        track for track in all_tracks
-        if not track.get("uri") or track["uri"] not in selected_uris
-    ]
-    sampled = on_repeat_sample + random.sample(
-        remaining_pool,
-        min(sample_size - len(on_repeat_sample), len(remaining_pool)),
-    )
-    inspiration = [f"{t['title']} - {t['artist']}" for t in sampled]
     logger.info(
-        "Gym Playlist: Using %s inspiration songs (%s from On Repeat)",
-        len(inspiration),
+        "Gym Playlist: Using %s inspiration songs (%s from On Repeat, %s from selected playlists)",
+        len(sampled),
         len(on_repeat_sample),
+        len(playlist_sample),
     )
 
     # 3. Load recent song history & ask Gemini
@@ -639,6 +647,7 @@ async def generate_gym_playlist(
         "playlist_name": playlist_name,
         "total_tracks": len(uris),
         "inspiration_count": len(inspiration),
+        "new_discoveries_count": len(uris),
         "auto_refresh": auto_refresh_val,
     }
 
