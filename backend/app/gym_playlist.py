@@ -5,8 +5,8 @@ Flow:
 1. User selects source playlists as inspiration
 2. Fetch tracks from those playlists
 3. Build 7 On-Repeat and 7 selected-playlist inspiration tracks when enabled
-4. Ask Gemini to generate 40 close-to-taste gym songs in workout phases
-5. Search each song on Spotify (with Redis cache)
+4. Ask Gemini to generate 40 consistently genre-matched gym songs
+5. Search each song on Spotify (with Redis cache and strict match validation)
 6. Delete old gym playlist if it exists
 7. Create a new Spotify playlist with a unique date-based name
 8. Optionally: auto-refresh daily at 3 AM (scheduler in main.py)
@@ -16,7 +16,10 @@ import json
 import random
 import asyncio
 import logging
+import re
+import unicodedata
 from datetime import date
+from difflib import SequenceMatcher
 
 import httpx
 import redis
@@ -46,8 +49,8 @@ HISTORY_TTL = 2 * 24 * 60 * 60  # 2 days in seconds
 
 
 def song_cache_key(title: str, artist: str) -> str:
-    # v2: invalidate old cache entries that may have stored clean/non-explicit URIs
-    return f"song_uri_v2::{title.lower().strip()}|||{artist.lower().strip()}"
+    # v3 invalidates entries created before strict title/artist match validation.
+    return f"song_uri_v3::{title.lower().strip()}|||{artist.lower().strip()}"
 
 
 def gym_history_key(user_id: int) -> str:
@@ -199,23 +202,60 @@ async def fetch_playlist_tracks(
     return tracks, current_token
 
 
-def _pick_best_track(items: list[dict]) -> dict | None:
-    """From a list of Spotify track items, prefer the explicit version."""
-    if not items:
-        return None
-    # Prefer explicit tracks
+def _normalize_music_text(value: str) -> str:
+    """Normalize titles/artists for resilient Spotify result comparison."""
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    value = value.lower().replace("&", " and ")
+    value = re.sub(r"\b(feat|featuring|ft)\.?\b.*$", "", value)
+    value = re.sub(r"\([^)]*\)|\[[^]]*]", " ", value)
+    return " ".join(re.findall(r"[a-z0-9]+", value))
+
+
+def _similarity(left: str, right: str) -> float:
+    normalized_left = _normalize_music_text(left)
+    normalized_right = _normalize_music_text(right)
+    if not normalized_left or not normalized_right:
+        return 0.0
+    if normalized_left == normalized_right:
+        return 1.0
+    return SequenceMatcher(None, normalized_left, normalized_right).ratio()
+
+
+def _pick_best_track(
+    items: list[dict], requested_title: str, requested_artist: str
+) -> dict | None:
+    """Pick only a Spotify result that closely matches title and artist."""
+    ranked: list[tuple[float, dict]] = []
     for track in items:
-        if track.get("explicit", False):
-            return track
-    # Fallback to first result if no explicit version found
-    return items[0]
+        title_score = _similarity(requested_title, track.get("name", ""))
+        artist_score = max(
+            (
+                _similarity(requested_artist, artist.get("name", ""))
+                for artist in track.get("artists", [])
+            ),
+            default=0.0,
+        )
+
+        # Reject unrelated search results instead of silently adding them.
+        if title_score < 0.72 or artist_score < 0.60:
+            continue
+
+        explicit_tiebreaker = 0.01 if track.get("explicit", False) else 0.0
+        ranked.append((title_score * 0.72 + artist_score * 0.28 + explicit_tiebreaker, track))
+
+    if not ranked:
+        return None
+    return max(ranked, key=lambda candidate: candidate[0])[1]
 
 
 async def robust_spotify_search(
-    query: str, spotify_token: str, max_retries: int = 3
+    title: str, artist: str, spotify_token: str, max_retries: int = 3
 ) -> dict | None:
-    """Spotify search with retry-after handling. Prefers explicit versions."""
+    """Search Spotify with retry handling and strict title/artist validation."""
     headers = {"Authorization": f"Bearer {spotify_token}"}
+    safe_title = title.replace('"', "")
+    safe_artist = artist.replace('"', "")
+    query = f'track:"{safe_title}" artist:"{safe_artist}"'
     params = {"q": query, "type": "track", "limit": 10}
 
     for attempt in range(max_retries):
@@ -225,8 +265,13 @@ async def robust_spotify_search(
             )
         if resp.status_code == 200:
             items = resp.json().get("tracks", {}).get("items", [])
-            track = _pick_best_track(items)
+            track = _pick_best_track(items, title, artist)
             if not track:
+                logger.warning(
+                    "No sufficiently close Spotify match for '%s - %s'",
+                    title,
+                    artist,
+                )
                 return None
             return {
                 "title": track["name"],
@@ -260,7 +305,7 @@ async def robust_spotify_search_with_cache(
     except Exception:
         pass
 
-    result = await robust_spotify_search(f"{title} {artist}", spotify_token)
+    result = await robust_spotify_search(title, artist, spotify_token)
     if result and result.get("uri"):
         try:
             redis_client.set(key, result["uri"])
@@ -323,45 +368,33 @@ async def ask_gemini_gym(inspiration_songs: list[str], recent_history: list[str]
     avoid_block = ""
     if recent_history:
         avoid_list = "\n".join(f"- {s}" for s in recent_history)
-        avoid_block = f"""\n\nIMPORTANT: The following songs were used in recent gym playlists (last 2 days).
-Do not include any of them. Choose different songs instead:
+        avoid_block = f"""\n\nRECENT HISTORY: Prefer different songs from this list when equally genre-fitting alternatives exist. Genre fit always has priority over avoiding history:
 {avoid_list}\n"""
 
-    prompt = f"""You are creating a personal 40-track gym playlist for this specific user.
+    prompt = f"""Create one cohesive 40-track gym playlist for this specific user.
 
-This is not a generic workout playlist and it is not a request to represent every genre.
-The user's current On Repeat songs are the strongest signal of what they actually want to hear right now. The selected playlist songs are a secondary signal. Stay close to the shared sound, artists, mood, and emotional character of those sources.
+First infer the dominant shared genre, subgenre, production style, and mood from the inspiration songs. Then select all 40 tracks from that same musical lane. Genre and taste fit are more important than variety, novelty, popularity, or an intensity curve.
 
-The inspiration list marks its sources with [ON REPEAT] and [SELECTED PLAYLIST]. When both are present, treat the 7 [ON REPEAT] songs as the primary anchor and the 7 [SELECTED PLAYLIST] songs as supporting context.
+The inspiration list marks its sources with [ON REPEAT] and [SELECTED PLAYLIST]. When both are present, treat On Repeat as the strongest taste signal and use the selected playlist to confirm the shared style.
 
-Recommendation balance:
-- About 30 of the 40 tracks (roughly 70–80%) must be safe, highly plausible matches: similar artists, nearby songs by artists the user likes, matching moods, or tracks with a very similar sound.
-- About 10 tracks may be controlled surprises, but they must still share the same overall vibe. Use adjacent sounds, related artists, or well-known songs the user may have forgotten — never random genre jumps.
-- Do not force every genre from the sources into the playlist. A genre that appears only incidentally should not suddenly dominate the result.
-- Gym suitability matters: choose songs with momentum, rhythm, confidence, emotional lift, or a motivating arc. Workout music does not have to mean the most aggressive, fastest, hardest, or most electronic option.
-- Do not include any inspiration song itself, do not use duplicates, and avoid songs from the recent-history block.
-
-Create the playlist in this exact workout order:
-- Warm-up (6 tracks): motivating and engaging, gradually building without starting at maximum intensity.
-- Main set (20 tracks): the user's strongest personal sound, with steady drive and tasteful variation.
-- Peak (8 tracks): the most powerful moments for hard sets or cardio, still clearly grounded in the user's taste.
-- Finish (6 tracks): uplifting, satisfying, and euphoric rather than relentlessly aggressive.
-
-Across the order, vary intensity and texture naturally, but do not use three songs with the same or extremely similar sonic character in a row. This is about flow within the user's taste, not forced genre diversity.
+Selection rules:
+- Every track must be a highly plausible match for the dominant genre and sound of the inspiration songs.
+- Do not add adjacent-genre experiments, controlled surprises, generic chart hits, or stereotypical gym music just to create variety.
+- Do not create warm-up, peak, finish, ramp-up, cooldown, or other workout phases. All 40 tracks should be equally suitable for the main workout.
+- Prefer matching artists, closely related artists, the same subgenre, and similar production over broad diversity.
+- Repeating an artist is acceptable when it improves fit; unrelated artist variety is not.
+- Inspiration songs may be included when they are strong gym tracks. Do not duplicate a song within the result.
+- Avoid recent-history songs when equally fitting alternatives exist, but never leave the core genre merely to avoid history.
+- Recommend only real, correctly spelled songs and artists that are likely available on Spotify.
 {avoid_block}
 Respond ONLY with valid JSON in this exact format:
 {{
-  "warm_up": [{{"title": "Song Name", "artist": "Artist Name"}}],
-  "main_set": [{{"title": "Song Name", "artist": "Artist Name"}}],
-  "peak": [{{"title": "Song Name", "artist": "Artist Name"}}],
-  "finish": [{{"title": "Song Name", "artist": "Artist Name"}}]
+  "songs": [
+    {{"title": "Song Name", "artist": "Artist Name"}}
+  ]
 }}
 
-Rules:
-- Return exactly 6 warm_up tracks, 20 main_set tracks, 8 peak tracks, and 6 finish tracks: exactly 40 total.
-- Keep each array in the exact order it should play.
-- Prioritize the [ON REPEAT] taste signal over broad genre variety.
-- Only output valid JSON, no markdown, no explanation.
+Return exactly 40 songs in one flat "songs" array. Do not include phases, labels, explanations, markdown, or additional fields.
 
 Here are the user's inspiration songs:
 {song_list}"""
@@ -369,8 +402,9 @@ Here are the user's inspiration songs:
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.9,
+            "temperature": 0.45,
             "maxOutputTokens": 8192,
+            "responseMimeType": "application/json",
         },
     }
 
@@ -394,10 +428,28 @@ Here are the user's inspiration songs:
         text = text.strip()
 
     try:
-        return json.loads(text)
+        result = json.loads(text)
     except json.JSONDecodeError as e:
         logger.error(f"Gemini returned invalid JSON: {text[:500]}")
         raise Exception(f"Gemini returned invalid JSON: {e}")
+
+    songs = result.get("songs")
+    if not isinstance(songs, list):
+        raise Exception("Gemini response is missing the flat 'songs' array")
+
+    valid_songs = [
+        song
+        for song in songs
+        if isinstance(song, dict)
+        and isinstance(song.get("title"), str)
+        and isinstance(song.get("artist"), str)
+        and song["title"].strip()
+        and song["artist"].strip()
+    ]
+    if len(valid_songs) < 40:
+        raise Exception(f"Gemini returned only {len(valid_songs)} valid songs instead of 40")
+
+    return {"songs": valid_songs[:40]}
 
 
 # ── Main generation pipeline ─────────────────────────
@@ -502,14 +554,9 @@ async def generate_gym_playlist(
 
     logger.info("Gym Playlist: Asking Gemini for recommendations...")
     gemini_result = await ask_gemini_gym(inspiration, recent_history if recent_history else None)
-    workout_phases = ("warm_up", "main_set", "peak", "finish")
-    gemini_songs = [
-        song
-        for phase in workout_phases
-        for song in gemini_result.get(phase, [])
-    ]
+    gemini_songs = gemini_result.get("songs", [])
     logger.info(
-        "Gym Playlist: Gemini returned %s tracks across warm-up, main set, peak, and finish",
+        "Gym Playlist: Gemini returned %s consistently matched tracks",
         len(gemini_songs),
     )
 
