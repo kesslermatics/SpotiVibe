@@ -636,7 +636,6 @@ async def generate_daily_walk_playlist(
             spotify_user_id=current_user.spotify_id,
             selected_show_ids=payload.selected_show_ids,
             duration_minutes=payload.duration_minutes,
-            walk_mood=payload.walk_mood,
             familiarity=payload.familiarity,
             user_id=current_user.id,
             existing_playlist_id=existing_playlist_id,
@@ -649,7 +648,6 @@ async def generate_daily_walk_playlist(
                 db.add(walk_settings)
             walk_settings.selected_show_ids = json.dumps(payload.selected_show_ids)
             walk_settings.duration_minutes = payload.duration_minutes
-            walk_settings.walk_mood = payload.walk_mood
             walk_settings.familiarity = payload.familiarity
             walk_settings.last_spotify_playlist_id = result["playlist_id"]
             db.commit()
@@ -712,7 +710,6 @@ def daily_walk_get_settings(
             "auto_refresh": False,
             "selected_show_ids": [],
             "duration_minutes": 45,
-            "walk_mood": "chill",
             "familiarity": 50,
             "last_spotify_playlist_id": None,
         }
@@ -727,7 +724,6 @@ def daily_walk_get_settings(
         "auto_refresh": walk_settings.auto_refresh,
         "selected_show_ids": selected_show_ids,
         "duration_minutes": walk_settings.duration_minutes,
-        "walk_mood": walk_settings.walk_mood,
         "familiarity": walk_settings.familiarity,
         "last_spotify_playlist_id": walk_settings.last_spotify_playlist_id,
     }
@@ -753,7 +749,6 @@ def daily_walk_toggle_auto_refresh(
         walk_settings.auto_refresh = payload.auto_refresh
         walk_settings.selected_show_ids = json.dumps(payload.selected_show_ids)
         walk_settings.duration_minutes = payload.duration_minutes
-        walk_settings.walk_mood = payload.walk_mood
         walk_settings.familiarity = payload.familiarity
         db.commit()
     except Exception as e:

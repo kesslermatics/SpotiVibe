@@ -28,13 +28,11 @@ interface DailyWalkSettings {
     auto_refresh: boolean;
     selected_show_ids: string[];
     duration_minutes: number;
-    walk_mood: WalkMood;
     familiarity: number;
     last_spotify_playlist_id: string | null;
 }
 
 type Step = "select" | "generating" | "done";
-type WalkMood = "chill" | "energetic" | "focus";
 
 const formatDuration = (minutes: number) =>
     minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ""}`;
@@ -51,7 +49,6 @@ export default function DailyWalkPage({ onLogout: _onLogout }: { onLogout: () =>
     const [result, setResult] = useState<DailyWalkResult | null>(null);
     const [generatingStep, setGeneratingStep] = useState(0);
     const [durationMinutes, setDurationMinutes] = useState(45);
-    const [walkMood, setWalkMood] = useState<WalkMood>("chill");
     const [familiarity, setFamiliarity] = useState(50);
     const [autoRefresh, setAutoRefresh] = useState(false);
     const [savingAutoRefresh, setSavingAutoRefresh] = useState(false);
@@ -93,7 +90,6 @@ export default function DailyWalkPage({ onLogout: _onLogout }: { onLogout: () =>
             .then((s) => {
                 setAutoRefresh(s.auto_refresh);
                 setDurationMinutes(s.duration_minutes);
-                setWalkMood(s.walk_mood);
                 setFamiliarity(s.familiarity);
                 if (s.selected_show_ids.length > 0) {
                     setSelectedShowIds(new Set(s.selected_show_ids));
@@ -123,7 +119,6 @@ export default function DailyWalkPage({ onLogout: _onLogout }: { onLogout: () =>
                     auto_refresh: enabled,
                     selected_show_ids: Array.from(selectedShowIds),
                     duration_minutes: durationMinutes,
-                    walk_mood: walkMood,
                     familiarity,
                 },
                 token,
@@ -147,7 +142,6 @@ export default function DailyWalkPage({ onLogout: _onLogout }: { onLogout: () =>
                 body: {
                     selected_show_ids: Array.from(selectedShowIds),
                     duration_minutes: durationMinutes,
-                    walk_mood: walkMood,
                     familiarity,
                 },
                 token: token || "",
@@ -249,31 +243,6 @@ export default function DailyWalkPage({ onLogout: _onLogout }: { onLogout: () =>
                                 <div className="mt-1 flex justify-between text-[11px] text-gray-500">
                                     <span>10 min</span>
                                     <span>3 h</span>
-                                </div>
-                            </div>
-
-                            {/* Walk mood */}
-                            <div>
-                                <h3 className="mb-2 text-sm font-semibold text-gray-300">🌿 Walk mood</h3>
-                                <div className="grid grid-cols-3 gap-2">
-                                    {([
-                                        ["chill", "😌", "Chill"],
-                                        ["energetic", "⚡", "Energetic"],
-                                        ["focus", "🧘", "Focus"],
-                                    ] as const).map(([mood, emoji, label]) => (
-                                        <button
-                                            key={mood}
-                                            type="button"
-                                            onClick={() => setWalkMood(mood)}
-                                            className={`rounded-xl px-2 py-3 text-xs font-medium transition ${walkMood === mood
-                                                ? "bg-teal-500/20 text-teal-200 ring-1 ring-teal-500/40"
-                                                : "bg-white/5 text-gray-400 hover:bg-white/10 hover:text-gray-200"
-                                                }`}
-                                        >
-                                            <span className="mb-1 block text-base">{emoji}</span>
-                                            {label}
-                                        </button>
-                                    ))}
                                 </div>
                             </div>
 

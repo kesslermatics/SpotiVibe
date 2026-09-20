@@ -171,7 +171,6 @@ async def fetch_show_episodes(show_id: str, spotify_token: str, limit: int = 20)
 async def ask_gemini_daily_walk(
     on_repeat_songs: list[dict],
     duration_minutes: int,
-    walk_mood: str,
     familiarity: int,
     recent_history: list[str] | None = None,
 ) -> dict:
@@ -186,11 +185,7 @@ async def ask_gemini_daily_walk(
     num_new = round(target_song_count * familiarity / 100)
     num_from_repeat = target_song_count - num_new
 
-    mood_guidance = {
-        "chill": "Create a relaxed, easy-going atmosphere: calm energy, clear headspace, great for a peaceful morning or afternoon stroll.",
-        "energetic": "Create an upbeat, motivating vibe: moderate-high energy, feel-good beats, the kind of music that puts a spring in your step.",
-        "focus": "Create a focused, deep-listening experience: atmospheric, minimal distraction, good for a contemplative solo walk.",
-    }.get(walk_mood, "Create a balanced, versatile mix suitable for a casual walk at any time of day.")
+    mood_guidance = "Create a versatile, feel-good mix that works for any kind of walk – mix calm and upbeat tracks naturally, just like a great shuffle would."
 
     avoid_block = ""
     if recent_history:
@@ -215,7 +210,7 @@ Your task:
 2. Recommend exactly {num_new} NEW songs not in the list, matching the style and mood.
 
 Walk duration: approximately {duration_minutes} minutes (music fills the gaps between podcast episodes).
-Mood: {walk_mood}. {mood_guidance}
+{mood_guidance}
 Discovery setting: {familiarity}% new → {num_from_repeat} familiar + {num_new} new.
 {avoid_block}
 Respond ONLY with valid JSON in this exact format, nothing else:
@@ -372,7 +367,6 @@ async def generate_daily_walk(
     spotify_user_id: str,
     selected_show_ids: list[str],
     duration_minutes: int,
-    walk_mood: str,
     familiarity: int,
     user_id: int | None = None,
     existing_playlist_id: str | None = None,
@@ -415,7 +409,6 @@ async def generate_daily_walk(
     gemini_result = await ask_gemini_daily_walk(
         on_repeat,
         duration_minutes=duration_minutes,
-        walk_mood=walk_mood,
         familiarity=familiarity,
         recent_history=recent_history if recent_history else None,
     )
@@ -654,7 +647,6 @@ async def auto_refresh_daily_walk_playlists() -> None:
                     spotify_user_id=user.spotify_id,
                     selected_show_ids=selected_show_ids,
                     duration_minutes=walk_settings.duration_minutes,
-                    walk_mood=walk_settings.walk_mood,
                     familiarity=walk_settings.familiarity,
                     user_id=user.id,
                     existing_playlist_id=walk_settings.last_spotify_playlist_id,

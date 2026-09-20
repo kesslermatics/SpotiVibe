@@ -33,5 +33,4 @@ class DailyWalkSettings(Base):
     last_spotify_playlist_id = Column(String, nullable=True)
     # Settings persisted so the scheduler can regenerate without user input
     duration_minutes = Column(Integer, default=45, nullable=False)
-    walk_mood = Column(String, default="chill", nullable=False)      # "chill" | "energetic" | "focus"
     familiarity = Column(Integer, default=50, nullable=False)        # 0–100

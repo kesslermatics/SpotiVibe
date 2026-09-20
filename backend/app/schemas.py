@@ -124,7 +124,6 @@ class GymPlaylistAutoRefreshRequest(BaseModel):
 class DailyWalkRequest(BaseModel):
     selected_show_ids: list[str] = []
     duration_minutes: int = Field(default=45, ge=10, le=180)
-    walk_mood: Literal["chill", "energetic", "focus"] = "chill"
     familiarity: int = Field(default=50, ge=0, le=100)  # 0 = familiar, 100 = discoveries
 
 
@@ -142,7 +141,6 @@ class DailyWalkSettingsResponse(BaseModel):
     auto_refresh: bool
     selected_show_ids: list[str]
     duration_minutes: int
-    walk_mood: str
     familiarity: int
     last_spotify_playlist_id: str | None
 
@@ -151,7 +149,6 @@ class DailyWalkAutoRefreshRequest(BaseModel):
     auto_refresh: bool
     selected_show_ids: list[str] = []
     duration_minutes: int = Field(default=45, ge=10, le=180)
-    walk_mood: Literal["chill", "energetic", "focus"] = "chill"
     familiarity: int = Field(default=50, ge=0, le=100)
 
 
