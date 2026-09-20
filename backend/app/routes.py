@@ -10,14 +10,24 @@ logger = logging.getLogger(__name__)
 from app.config import get_settings
 from app.database import get_db
 from app.models import User
-from app.schemas import SpotifyCallback, Token, UserResponse, MessageResponse, DiscoverRequest, DiscoverResponse, CreatePlaylistRequest, CreatePlaylistResponse, SaveTracksRequest, SaveTracksResponse, DailyDriveRequest, DailyDriveResponse, GymPlaylistGenerateRequest, GymPlaylistGenerateResponse, GymPlaylistSettingsResponse, GymPlaylistAutoRefreshRequest, SwipeDeckResponse, RoastResponse
+from app.schemas import (
+    SpotifyCallback, Token, UserResponse, MessageResponse,
+    DiscoverRequest, DiscoverResponse,
+    CreatePlaylistRequest, CreatePlaylistResponse,
+    SaveTracksRequest, SaveTracksResponse,
+    DailyDriveRequest, DailyDriveResponse,
+    GymPlaylistGenerateRequest, GymPlaylistGenerateResponse, GymPlaylistSettingsResponse, GymPlaylistAutoRefreshRequest,
+    DailyWalkRequest, DailyWalkResponse, DailyWalkSettingsResponse, DailyWalkAutoRefreshRequest,
+    SwipeDeckResponse, RoastResponse,
+)
 from app.auth import create_access_token, get_current_user, get_valid_spotify_token, refresh_spotify_token
 from app.discover import discover_songs
 from app.daily_drive import fetch_saved_shows, generate_daily_drive, fetch_on_repeat_tracks
+from app.daily_walk import fetch_saved_shows as walk_fetch_saved_shows, generate_daily_walk
 from app.gym_playlist import generate_gym_playlist, parse_gym_sources
 from app.roast import generate_vibe_roast
 from app.cover_gen import generate_playlist_cover, upload_playlist_cover
-from app.models import GymPlaylistSettings
+from app.models import GymPlaylistSettings, DailyWalkSettings
 import json
 
 router = APIRouter()
@@ -579,6 +589,185 @@ async def generate_daily_drive_playlist(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Daily Drive creation failed: {str(e)}",
         )
+
+
+# ── Daily Walk: Shows ────────────────────────────────
+@router.get("/daily-walk/shows")
+async def get_daily_walk_shows(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the user's saved podcast shows for Daily Walk selection."""
+    spotify_token = await get_valid_spotify_token(current_user, db)
+    try:
+        shows = await walk_fetch_saved_shows(spotify_token)
+        return {"shows": shows}
+    except Exception as e:
+        logger.error(f"Daily Walk: Could not fetch shows: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not fetch podcasts: {str(e)}",
+        )
+
+
+# ── Daily Walk: Generate ─────────────────────────────
+@router.post("/daily-walk/generate", response_model=DailyWalkResponse)
+async def generate_daily_walk_playlist(
+    payload: DailyWalkRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Generate a Daily Walk playlist and optionally save settings for auto-refresh."""
+    spotify_token = await get_valid_spotify_token(current_user, db)
+
+    # Look up existing settings to reuse the playlist ID if auto-refresh is on
+    walk_settings = (
+        db.query(DailyWalkSettings)
+        .filter(DailyWalkSettings.user_id == current_user.id)
+        .first()
+    )
+    existing_playlist_id = (
+        walk_settings.last_spotify_playlist_id if walk_settings and walk_settings.auto_refresh else None
+    )
+
+    try:
+        result = await generate_daily_walk(
+            spotify_token=spotify_token,
+            spotify_user_id=current_user.spotify_id,
+            selected_show_ids=payload.selected_show_ids,
+            duration_minutes=payload.duration_minutes,
+            walk_mood=payload.walk_mood,
+            familiarity=payload.familiarity,
+            user_id=current_user.id,
+            existing_playlist_id=existing_playlist_id,
+        )
+
+        # Persist settings so the scheduler can re-run this automatically
+        try:
+            if not walk_settings:
+                walk_settings = DailyWalkSettings(user_id=current_user.id)
+                db.add(walk_settings)
+            walk_settings.selected_show_ids = json.dumps(payload.selected_show_ids)
+            walk_settings.duration_minutes = payload.duration_minutes
+            walk_settings.walk_mood = payload.walk_mood
+            walk_settings.familiarity = payload.familiarity
+            walk_settings.last_spotify_playlist_id = result["playlist_id"]
+            db.commit()
+        except Exception as db_err:
+            logger.warning(f"Daily Walk: Could not persist settings: {db_err}")
+            db.rollback()
+
+        # Generate and upload AI cover image
+        playlist_id = result.get("playlist_id")
+        if playlist_id:
+            try:
+                cover_b64 = await generate_playlist_cover(
+                    playlist_name=result.get("playlist_name", "Daily Walk"),
+                    mood_summary="A peaceful walk mix of favorite songs, fresh discoveries, and podcasts – calm outdoor vibes, natural light, easy steps",
+                    playlist_description=f"Daily Walk – {result.get('on_repeat_count', 0)} On-Repeat Songs, {result.get('new_discoveries_count', 0)} new discoveries",
+                )
+                if cover_b64:
+                    spotify_token = await get_valid_spotify_token(current_user, db)
+                    cover_uploaded = await upload_playlist_cover(
+                        playlist_id=playlist_id,
+                        image_base64=cover_b64,
+                        spotify_token=spotify_token,
+                    )
+                    if cover_uploaded:
+                        logger.info(f"[Daily Walk] AI cover uploaded for playlist {playlist_id}")
+                    else:
+                        logger.warning(f"[Daily Walk] Cover upload failed, using default")
+                else:
+                    logger.warning(f"[Daily Walk] Cover generation returned None")
+            except Exception as cover_err:
+                logger.warning(f"[Daily Walk] Cover generation failed (non-fatal): {cover_err}")
+
+        return result
+    except Exception as e:
+        logger.error(f"Daily Walk generation failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Daily Walk creation failed: {str(e)}",
+        )
+
+
+# ── Daily Walk: Get settings ─────────────────────────
+@router.get("/daily-walk/settings", response_model=DailyWalkSettingsResponse)
+def daily_walk_get_settings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        walk_settings = (
+            db.query(DailyWalkSettings)
+            .filter(DailyWalkSettings.user_id == current_user.id)
+            .first()
+        )
+    except Exception as e:
+        logger.warning(f"Could not query DailyWalkSettings: {e}")
+        walk_settings = None
+
+    if not walk_settings:
+        return {
+            "auto_refresh": False,
+            "selected_show_ids": [],
+            "duration_minutes": 45,
+            "walk_mood": "chill",
+            "familiarity": 50,
+            "last_spotify_playlist_id": None,
+        }
+
+    selected_show_ids: list[str] = []
+    try:
+        selected_show_ids = json.loads(walk_settings.selected_show_ids or "[]")
+    except Exception:
+        pass
+
+    return {
+        "auto_refresh": walk_settings.auto_refresh,
+        "selected_show_ids": selected_show_ids,
+        "duration_minutes": walk_settings.duration_minutes,
+        "walk_mood": walk_settings.walk_mood,
+        "familiarity": walk_settings.familiarity,
+        "last_spotify_playlist_id": walk_settings.last_spotify_playlist_id,
+    }
+
+
+# ── Daily Walk: Toggle auto-refresh ──────────────────
+@router.put("/daily-walk/auto-refresh")
+def daily_walk_toggle_auto_refresh(
+    payload: DailyWalkAutoRefreshRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        walk_settings = (
+            db.query(DailyWalkSettings)
+            .filter(DailyWalkSettings.user_id == current_user.id)
+            .first()
+        )
+        if not walk_settings:
+            walk_settings = DailyWalkSettings(user_id=current_user.id)
+            db.add(walk_settings)
+
+        walk_settings.auto_refresh = payload.auto_refresh
+        walk_settings.selected_show_ids = json.dumps(payload.selected_show_ids)
+        walk_settings.duration_minutes = payload.duration_minutes
+        walk_settings.walk_mood = payload.walk_mood
+        walk_settings.familiarity = payload.familiarity
+        db.commit()
+    except Exception as e:
+        logger.error(f"Daily Walk: Could not save auto-refresh setting: {e}")
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not save setting: {str(e)}",
+        )
+
+    return {
+        "auto_refresh": walk_settings.auto_refresh,
+        "message": "Auto-refresh enabled" if payload.auto_refresh else "Auto-refresh disabled",
+    }
 
 
 # ── Gym Playlist: Generate ───────────────────────────

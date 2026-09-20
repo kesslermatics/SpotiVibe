@@ -5,6 +5,7 @@ import CallbackPage from "./pages/CallbackPage";
 import HomePage from "./pages/HomePage";
 import DiscoverPage from "./pages/DiscoverPage";
 import DailyDrivePage from "./pages/DailyDrivePage";
+import DailyWalkPage from "./pages/DailyWalkPage";
 import GymPlaylistPage from "./pages/GymPlaylistPage";
 import SwipeDeckPage from "./pages/SwipeDeckPage";
 import RoastPage from "./pages/RoastPage";
@@ -34,6 +35,7 @@ function App() {
         <Route path="/" element={isLoggedIn ? <HomePage onLogout={logout} /> : <Navigate to="/login" replace />} />
         <Route path="/discover" element={isLoggedIn ? <DiscoverPage onLogout={logout} /> : <Navigate to="/login" replace />} />
         <Route path="/daily-drive" element={isLoggedIn ? <DailyDrivePage onLogout={logout} /> : <Navigate to="/login" replace />} />
+        <Route path="/daily-walk" element={isLoggedIn ? <DailyWalkPage onLogout={logout} /> : <Navigate to="/login" replace />} />
         <Route path="/gym-playlist" element={isLoggedIn ? <GymPlaylistPage onLogout={logout} /> : <Navigate to="/login" replace />} />
         <Route path="/swipe-deck" element={isLoggedIn ? <SwipeDeckPage onLogout={logout} /> : <Navigate to="/login" replace />} />
         <Route path="/vibe-roast" element={isLoggedIn ? <RoastPage onLogout={logout} /> : <Navigate to="/login" replace />} />

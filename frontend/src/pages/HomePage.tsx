@@ -35,6 +35,14 @@ const tiles: Tile[] = [
         route: "/daily-drive",
     },
     {
+        id: "daily-walk",
+        emoji: "🚶",
+        title: "Daily Walk",
+        description: "Chill walk mix – more podcasts, less music (2 songs → 1 episode)",
+        color: "from-teal-500/20 to-cyan-500/10 hover:ring-teal-500/40",
+        route: "/daily-walk",
+    },
+    {
         id: "swipe",
         emoji: "💿",
         title: "Swipe Deck",
@@ -49,14 +57,6 @@ const tiles: Tile[] = [
         description: "AI analyzes your music taste and roasts you mercilessly",
         color: "from-orange-500/20 to-red-500/10 hover:ring-orange-500/40",
         route: "/vibe-roast",
-    },
-    {
-        id: "playlists",
-        emoji: "📋",
-        title: "Playlists",
-        description: "Your saved playlists and favorites",
-        color: "from-sky-500/20 to-blue-500/10 hover:ring-sky-500/40",
-        route: "/",
     },
     {
         id: "gym-playlist",
@@ -116,7 +116,7 @@ export default function HomePage({ onLogout }: { onLogout: () => void }) {
                 {/* Feature Tiles */}
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                     {tiles.map((tile) => {
-                        const isAvailable = tile.id === "discover" || tile.id === "daily-drive" || tile.id === "gym-playlist" || tile.id === "swipe" || tile.id === "vibe-roast";
+                        const isAvailable = tile.id === "discover" || tile.id === "daily-drive" || tile.id === "daily-walk" || tile.id === "gym-playlist" || tile.id === "swipe" || tile.id === "vibe-roast";
                         return (
                             <button
                                 key={tile.id}

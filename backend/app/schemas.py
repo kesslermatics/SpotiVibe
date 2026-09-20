@@ -120,6 +120,41 @@ class GymPlaylistAutoRefreshRequest(BaseModel):
     auto_refresh: bool
 
 
+# ── Daily Walk ───────────────────────────────────────
+class DailyWalkRequest(BaseModel):
+    selected_show_ids: list[str] = []
+    duration_minutes: int = Field(default=45, ge=10, le=180)
+    walk_mood: Literal["chill", "energetic", "focus"] = "chill"
+    familiarity: int = Field(default=50, ge=0, le=100)  # 0 = familiar, 100 = discoveries
+
+
+class DailyWalkResponse(BaseModel):
+    playlist_url: str
+    playlist_id: str
+    playlist_name: str
+    total_tracks: int
+    on_repeat_count: int
+    new_discoveries_count: int
+    episodes_count: int
+
+
+class DailyWalkSettingsResponse(BaseModel):
+    auto_refresh: bool
+    selected_show_ids: list[str]
+    duration_minutes: int
+    walk_mood: str
+    familiarity: int
+    last_spotify_playlist_id: str | None
+
+
+class DailyWalkAutoRefreshRequest(BaseModel):
+    auto_refresh: bool
+    selected_show_ids: list[str] = []
+    duration_minutes: int = Field(default=45, ge=10, le=180)
+    walk_mood: Literal["chill", "energetic", "focus"] = "chill"
+    familiarity: int = Field(default=50, ge=0, le=100)
+
+
 # ── Swipe Deck ────────────────────────────────────────
 class SwipeTrack(BaseModel):
     id: str
