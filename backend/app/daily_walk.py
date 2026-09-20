@@ -179,9 +179,9 @@ async def ask_gemini_daily_walk(
         f"- {s['title']} – {s['artist']}" for s in on_repeat_songs
     )
 
-    # Daily Walk is more relaxed – shorter chunks of music between podcast episodes.
-    # With 2 songs per episode, we need fewer songs overall.
-    target_song_count = max(4, min(40, round(duration_minutes / 4.0)))
+    # Daily Walk has shorter music blocks (2 songs between episodes).
+    # Keep the count conservative to avoid Gemini truncation.
+    target_song_count = max(4, min(20, round(duration_minutes / 6.0)))
     num_new = round(target_song_count * familiarity / 100)
     num_from_repeat = target_song_count - num_new
 
@@ -213,7 +213,7 @@ Walk duration: approximately {duration_minutes} minutes (music fills the gaps be
 {mood_guidance}
 Discovery setting: {familiarity}% new → {num_from_repeat} familiar + {num_new} new.
 {avoid_block}
-Respond ONLY with valid JSON in this exact format, nothing else:
+Respond ONLY with valid, pretty-printed JSON in this exact format, nothing else:
 {{
   "from_repeat": [
     {{"title": "Song Name", "artist": "Artist Name"}},
@@ -242,38 +242,53 @@ Rules:
         }],
         "generationConfig": {
             "temperature": 1.6,
-            "maxOutputTokens": 8192,
+            "maxOutputTokens": 16384,
             "topP": 0.95,
             "topK": 64,
+            "responseMimeType": "application/json",
         },
     }
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(GEMINI_URL, json=payload)
+    last_error: Exception | None = None
+    for attempt in range(3):
+        if attempt > 0:
+            logger.warning(f"Daily Walk: Gemini retry {attempt}/2 after invalid JSON...")
+            await asyncio.sleep(2)
 
-    if resp.status_code != 200:
-        logger.error(f"Daily Walk Gemini error: {resp.status_code} – {resp.text[:500]}")
-        raise Exception(f"Gemini API error: {resp.status_code}")
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(GEMINI_URL, json=payload)
 
-    data = resp.json()
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError) as e:
-        logger.error(f"Daily Walk: Unexpected Gemini response: {json.dumps(data)[:500]}")
-        raise Exception(f"Unexpected Gemini response: {e}")
+        if resp.status_code != 200:
+            logger.error(f"Daily Walk Gemini error: {resp.status_code} - {resp.text[:500]}")
+            raise Exception(f"Gemini API error: {resp.status_code}")
 
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        if text.endswith("```"):
-            text = text[:-3]
+        data = resp.json()
+        try:
+            candidate = data["candidates"][0]
+            finish_reason = candidate.get("finishReason", "UNKNOWN")
+            text = candidate["content"]["parts"][0]["text"]
+            if finish_reason not in ("STOP", ""):
+                logger.warning(f"Daily Walk: Gemini finishReason={finish_reason}, response may be truncated")
+        except (KeyError, IndexError) as e:
+            logger.error(f"Daily Walk: Unexpected Gemini response: {json.dumps(data)[:500]}")
+            last_error = Exception(f"Unexpected Gemini response: {e}")
+            continue
+
         text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.error(f"Daily Walk: Gemini invalid JSON: {text[:500]}")
-        raise Exception(f"Gemini returned invalid JSON: {e}")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            logger.error(f"Daily Walk: Gemini invalid JSON (attempt {attempt+1}): {text[:300]}")
+            last_error = Exception(f"Gemini returned invalid JSON: {e}")
+            continue
+
+    raise last_error or Exception("Gemini failed after 3 attempts")
 
 
 # ── Spotify search helpers ─────────────────────────────

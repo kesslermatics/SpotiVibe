@@ -296,35 +296,42 @@ Rules:
         },
     }
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(GEMINI_URL, json=payload)
+    last_error: Exception | None = None
+    for attempt in range(3):
+        if attempt > 0:
+            logger.warning(f"Daily Drive: Gemini retry {attempt}/2 after invalid JSON...")
+            await asyncio.sleep(2)
 
-    if resp.status_code != 200:
-        logger.error(f"Gemini API error: {resp.status_code} – {resp.text[:500]}")
-        raise Exception(f"Gemini API error: {resp.status_code} – {resp.text[:200]}")
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(GEMINI_URL, json=payload)
 
-    data = resp.json()
-    
-    # Safely extract text from Gemini response
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError) as e:
-        logger.error(f"Unexpected Gemini response structure: {json.dumps(data)[:500]}")
-        raise Exception(f"Unexpected Gemini response: {e}")
+        if resp.status_code != 200:
+            logger.error(f"Gemini API error: {resp.status_code} - {resp.text[:500]}")
+            raise Exception(f"Gemini API error: {resp.status_code} - {resp.text[:200]}")
 
-    # Strip markdown code fences if present
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        if text.endswith("```"):
-            text = text[:-3]
+        data = resp.json()
+        try:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError) as e:
+            logger.error(f"Unexpected Gemini response structure: {json.dumps(data)[:500]}")
+            last_error = Exception(f"Unexpected Gemini response: {e}")
+            continue
+
         text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.error(f"Gemini returned invalid JSON: {text[:500]}")
-        raise Exception(f"Gemini returned invalid JSON: {e}")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            logger.error(f"Daily Drive: Gemini invalid JSON (attempt {attempt+1}): {text[:500]}")
+            last_error = Exception(f"Gemini returned invalid JSON: {e}")
+            continue
+
+    raise last_error or Exception("Gemini failed after 3 attempts")
 
 
 def _pick_best_track(items: list[dict]) -> dict | None:
