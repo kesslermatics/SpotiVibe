@@ -336,18 +336,18 @@ async def robust_spotify_search_with_cache(title: str, artist: str, spotify_toke
 
 
 async def robust_add_items_to_playlist(
-    client: httpx.AsyncClient,
     playlist_id: str,
     chunk: list[str],
     auth_headers: dict,
     max_retries: int = 3,
 ) -> bool:
     for attempt in range(max_retries):
-        resp = await client.post(
-            f"{SPOTIFY_API}/playlists/{playlist_id}/tracks",
-            headers=auth_headers,
-            json={"uris": chunk},
-        )
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{SPOTIFY_API}/playlists/{playlist_id}/items",
+                headers=auth_headers,
+                json={"uris": chunk},
+            )
         if resp.status_code in (200, 201):
             return True
         if resp.status_code == 429:
@@ -355,7 +355,6 @@ async def robust_add_items_to_playlist(
             logger.warning(f"Daily Walk: Playlist add 429, waiting {retry_after}s")
             await asyncio.sleep(retry_after)
         elif resp.status_code == 403:
-            # Spotify sometimes returns 403 briefly after playlist creation – wait and retry
             wait = 3 * (attempt + 1)
             logger.warning(f"Daily Walk: Playlist add 403 (attempt {attempt+1}), waiting {wait}s before retry")
             await asyncio.sleep(wait)
@@ -549,75 +548,76 @@ async def generate_daily_walk(
     )
     auth_headers = {"Authorization": f"Bearer {spotify_token}"}
 
-    async with httpx.AsyncClient() as client:
-        if existing_playlist_id:
-            # Check if the existing playlist still exists
+    # Check / create playlist with its own short-lived client
+    if existing_playlist_id:
+        async with httpx.AsyncClient() as client:
             check_resp = await client.get(
                 f"{SPOTIFY_API}/playlists/{existing_playlist_id}",
                 headers=auth_headers,
                 params={"fields": "id"},
             )
-            if check_resp.status_code != 200:
-                logger.warning(f"Daily Walk: Existing playlist {existing_playlist_id} not found ({check_resp.status_code}), will create a new one")
-                existing_playlist_id = None
+        if check_resp.status_code != 200:
+            logger.warning(f"Daily Walk: Existing playlist {existing_playlist_id} not found ({check_resp.status_code}), creating new one")
+            existing_playlist_id = None
 
-        if existing_playlist_id:
-            # Rename and clear existing playlist
+    if existing_playlist_id:
+        # Rename the playlist
+        async with httpx.AsyncClient() as client:
             await client.put(
                 f"{SPOTIFY_API}/playlists/{existing_playlist_id}",
                 headers=auth_headers,
                 json={"name": playlist_name, "description": playlist_desc},
             )
-            # Remove all existing tracks
+            # Fetch existing tracks to remove them
             current_tracks_resp = await client.get(
                 f"{SPOTIFY_API}/playlists/{existing_playlist_id}/tracks",
                 headers=auth_headers,
                 params={"fields": "items(track(uri)),next", "limit": 100},
             )
-            if current_tracks_resp.status_code == 200:
-                existing_uris = [
-                    item["track"]["uri"]
-                    for item in current_tracks_resp.json().get("items", [])
-                    if item.get("track")
-                ]
-                if existing_uris:
+        if current_tracks_resp.status_code == 200:
+            existing_uris = [
+                item["track"]["uri"]
+                for item in current_tracks_resp.json().get("items", [])
+                if item.get("track")
+            ]
+            if existing_uris:
+                async with httpx.AsyncClient() as client:
                     await client.request(
                         "DELETE",
                         f"{SPOTIFY_API}/playlists/{existing_playlist_id}/tracks",
                         headers=auth_headers,
                         json={"tracks": [{"uri": u} for u in existing_uris]},
                     )
-            playlist_id = existing_playlist_id
-            playlist_url = f"https://open.spotify.com/playlist/{playlist_id}"
-            logger.info(f"Daily Walk: Reusing existing playlist {playlist_id}")
-        else:
-            # Create new playlist
+        playlist_id = existing_playlist_id
+        playlist_url = f"https://open.spotify.com/playlist/{playlist_id}"
+        logger.info(f"Daily Walk: Reusing existing playlist {playlist_id}")
+    else:
+        async with httpx.AsyncClient() as client:
             create_resp = await client.post(
                 f"{SPOTIFY_API}/me/playlists",
                 headers=auth_headers,
                 json={"name": playlist_name, "description": playlist_desc, "public": False},
             )
-            if create_resp.status_code not in (200, 201):
-                raise Exception(f"Could not create playlist: {create_resp.text}")
-            playlist = create_resp.json()
-            playlist_id = playlist["id"]
-            playlist_url = playlist["external_urls"]["spotify"]
-            logger.info(f"Daily Walk: Created new playlist {playlist_id}")
-            # Spotify needs a moment to propagate a brand-new playlist before tracks can be added
-            await asyncio.sleep(2)
+        if create_resp.status_code not in (200, 201):
+            raise Exception(f"Could not create playlist: {create_resp.text}")
+        playlist = create_resp.json()
+        playlist_id = playlist["id"]
+        playlist_url = playlist["external_urls"]["spotify"]
+        logger.info(f"Daily Walk: Created new playlist {playlist_id}")
+        # Small delay so Spotify propagates the new playlist before we add tracks
+        await asyncio.sleep(1)
 
-        # Add tracks in chunks of 100
-        add_success = True
-        for i in range(0, len(final_uris), 100):
-            chunk = final_uris[i: i + 100]
-            success = await robust_add_items_to_playlist(client, playlist_id, chunk, auth_headers)
-            if not success:
-                logger.error(f"Daily Walk: Failed to add chunk {i}-{i+len(chunk)} after retries")
-                add_success = False
+    # Add tracks in chunks of 100 – each chunk uses its own fresh client (like gym_playlist.py)
+    add_success = True
+    for i in range(0, len(final_uris), 100):
+        chunk = final_uris[i: i + 100]
+        success = await robust_add_items_to_playlist(playlist_id, chunk, auth_headers)
+        if not success:
+            logger.error(f"Daily Walk: Failed to add chunk {i}-{i+len(chunk)} after retries")
+            add_success = False
 
     if not add_success:
         logger.error(f"Daily Walk: Some tracks could not be added to playlist {playlist_id}")
-        # Don't persist this playlist_id – it's broken. Signal this to the caller.
         playlist_id = None
 
     logger.info(f"Daily Walk: Done. Playlist {playlist_id} has {len(final_uris)} items.")
