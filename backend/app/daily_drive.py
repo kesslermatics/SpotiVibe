@@ -393,6 +393,11 @@ async def robust_add_items_to_playlist(client, playlist_id, chunk, auth_headers,
             logger.warning(f"Playlist add 429, Retry-After={retry_after}s, waiting {wait}s (attempt {attempt+1}/{max_retries})")
             await asyncio.sleep(wait)
             continue
+        if add_resp.status_code == 403:
+            wait = 3 * (attempt + 1)
+            logger.warning(f"Playlist add 403 (attempt {attempt+1}), waiting {wait}s before retry")
+            await asyncio.sleep(wait)
+            continue
         logger.error(f"Failed to add items to playlist: {add_resp.status_code} {add_resp.text[:300]}")
         return False
     logger.error(f"Failed to add items after {max_retries} retries.")
@@ -646,6 +651,9 @@ async def generate_daily_drive(
 
         playlist = create_resp.json()
         playlist_id = playlist["id"]
+
+        # Spotify needs a moment to propagate a brand-new playlist before tracks can be added
+        await asyncio.sleep(2)
 
         # Add items in chunks of 100
         for i in range(0, len(final_uris), 100):

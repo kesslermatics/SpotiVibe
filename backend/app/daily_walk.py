@@ -354,6 +354,11 @@ async def robust_add_items_to_playlist(
             retry_after = int(resp.headers.get("Retry-After", "5"))
             logger.warning(f"Daily Walk: Playlist add 429, waiting {retry_after}s")
             await asyncio.sleep(retry_after)
+        elif resp.status_code == 403:
+            # Spotify sometimes returns 403 briefly after playlist creation – wait and retry
+            wait = 3 * (attempt + 1)
+            logger.warning(f"Daily Walk: Playlist add 403 (attempt {attempt+1}), waiting {wait}s before retry")
+            await asyncio.sleep(wait)
         else:
             logger.error(f"Daily Walk: Add items failed {resp.status_code}: {resp.text[:200]}")
             return False
@@ -587,6 +592,8 @@ async def generate_daily_walk(
             playlist_id = playlist["id"]
             playlist_url = playlist["external_urls"]["spotify"]
             logger.info(f"Daily Walk: Created new playlist {playlist_id}")
+            # Spotify needs a moment to propagate a brand-new playlist before tracks can be added
+            await asyncio.sleep(2)
 
         # Add tracks in chunks of 100
         for i in range(0, len(final_uris), 100):
