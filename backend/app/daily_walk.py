@@ -551,6 +551,17 @@ async def generate_daily_walk(
 
     async with httpx.AsyncClient() as client:
         if existing_playlist_id:
+            # Check if the existing playlist still exists
+            check_resp = await client.get(
+                f"{SPOTIFY_API}/playlists/{existing_playlist_id}",
+                headers=auth_headers,
+                params={"fields": "id"},
+            )
+            if check_resp.status_code != 200:
+                logger.warning(f"Daily Walk: Existing playlist {existing_playlist_id} not found ({check_resp.status_code}), will create a new one")
+                existing_playlist_id = None
+
+        if existing_playlist_id:
             # Rename and clear existing playlist
             await client.put(
                 f"{SPOTIFY_API}/playlists/{existing_playlist_id}",
@@ -596,21 +607,29 @@ async def generate_daily_walk(
             await asyncio.sleep(2)
 
         # Add tracks in chunks of 100
+        add_success = True
         for i in range(0, len(final_uris), 100):
             chunk = final_uris[i: i + 100]
             success = await robust_add_items_to_playlist(client, playlist_id, chunk, auth_headers)
             if not success:
                 logger.error(f"Daily Walk: Failed to add chunk {i}-{i+len(chunk)} after retries")
+                add_success = False
+
+    if not add_success:
+        logger.error(f"Daily Walk: Some tracks could not be added to playlist {playlist_id}")
+        # Don't persist this playlist_id – it's broken. Signal this to the caller.
+        playlist_id = None
 
     logger.info(f"Daily Walk: Done. Playlist {playlist_id} has {len(final_uris)} items.")
     return {
-        "playlist_url": playlist_url,
+        "playlist_url": playlist_url if playlist_id else None,
         "playlist_id": playlist_id,
         "playlist_name": playlist_name,
         "total_tracks": len(final_uris),
         "on_repeat_count": len(from_repeat_uris),
         "new_discoveries_count": len(new_discovery_uris),
         "episodes_count": len(episode_uris),
+        "add_failed": not add_success,
     }
 
 

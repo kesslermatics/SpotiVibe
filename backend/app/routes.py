@@ -649,11 +649,22 @@ async def generate_daily_walk_playlist(
             walk_settings.selected_show_ids = json.dumps(payload.selected_show_ids)
             walk_settings.duration_minutes = payload.duration_minutes
             walk_settings.familiarity = payload.familiarity
-            walk_settings.last_spotify_playlist_id = result["playlist_id"]
+            # Only persist playlist_id if tracks were actually added successfully
+            if result.get("playlist_id"):
+                walk_settings.last_spotify_playlist_id = result["playlist_id"]
+            else:
+                walk_settings.last_spotify_playlist_id = None
             db.commit()
         except Exception as db_err:
             logger.warning(f"Daily Walk: Could not persist settings: {db_err}")
             db.rollback()
+
+        # If track-adding failed, raise an error now (after persisting settings without broken playlist_id)
+        if result.get("add_failed"):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Playlist was created but Spotify refused to add tracks (403). Please try again.",
+            )
 
         # Generate and upload AI cover image
         playlist_id = result.get("playlist_id")

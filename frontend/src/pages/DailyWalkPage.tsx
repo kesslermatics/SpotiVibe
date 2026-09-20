@@ -207,7 +207,7 @@ export default function DailyWalkPage({ onLogout: _onLogout }: { onLogout: () =>
                                 </li>
                                 <li className="flex items-start gap-2">
                                     <span className="mt-0.5 text-teal-400">🤖</span>
-                                    AI picks songs that match your walking mood
+                                    AI picks your favorites + new discoveries based on your taste
                                 </li>
                                 <li className="flex items-start gap-2">
                                     <span className="mt-0.5 text-teal-400">🎙️</span>
