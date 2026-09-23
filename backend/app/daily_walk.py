@@ -389,6 +389,8 @@ async def generate_daily_walk(
     familiarity: int,
     user_id: int | None = None,
     existing_playlist_id: str | None = None,
+    user: "User | None" = None,
+    db: "Session | None" = None,
 ) -> dict:
     """
     Full Daily Walk generation pipeline.
@@ -459,6 +461,10 @@ async def generate_daily_walk(
                 unmatched_from_repeat.append(song)
 
     # 5. Search Spotify for unmatched + new discoveries
+    # Refresh token before the search loop – Gemini took ~30s and the token may have expired
+    if user and db:
+        spotify_token = await get_valid_spotify_token(user, db)
+
     all_to_search = (
         [{"song": s, "type": "from_repeat"} for s in unmatched_from_repeat]
         + [{"song": s, "type": "new_discovery"} for s in gemini_result.get("new_discoveries", [])]
@@ -553,6 +559,10 @@ async def generate_daily_walk(
             ep_idx += 1
 
     # 9. Create or replace the Spotify playlist
+    # Refresh token again – the search loop took another ~20s
+    if user and db:
+        spotify_token = await get_valid_spotify_token(user, db)
+
     today = date.today().strftime("%d.%m.%Y")
     playlist_name = f"Daily Walk – {today}"
     playlist_desc = (
@@ -691,6 +701,8 @@ async def auto_refresh_daily_walk_playlists() -> None:
                     familiarity=walk_settings.familiarity,
                     user_id=user.id,
                     existing_playlist_id=walk_settings.last_spotify_playlist_id,
+                    user=user,
+                    db=db,
                 )
 
                 # Persist the new playlist ID back
