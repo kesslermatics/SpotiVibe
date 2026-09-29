@@ -621,15 +621,13 @@ async def generate_daily_walk_playlist(
     """Generate a Daily Walk playlist and optionally save settings for auto-refresh."""
     spotify_token = await get_valid_spotify_token(current_user, db)
 
-    # Look up existing settings to reuse the playlist ID if auto-refresh is on
+    # Reuse an existing Daily Walk regardless of whether auto-refresh is enabled.
     walk_settings = (
         db.query(DailyWalkSettings)
         .filter(DailyWalkSettings.user_id == current_user.id)
         .first()
     )
-    existing_playlist_id = (
-        walk_settings.last_spotify_playlist_id if walk_settings and walk_settings.auto_refresh else None
-    )
+    existing_playlist_id = walk_settings.last_spotify_playlist_id if walk_settings else None
 
     try:
         result = await generate_daily_walk(
@@ -640,6 +638,8 @@ async def generate_daily_walk_playlist(
             familiarity=payload.familiarity,
             user_id=current_user.id,
             existing_playlist_id=existing_playlist_id,
+            user=current_user,
+            db=db,
         )
 
         # Persist settings so the scheduler can re-run this automatically
@@ -660,7 +660,7 @@ async def generate_daily_walk_playlist(
             logger.warning(f"Daily Walk: Could not persist settings: {db_err}")
             db.rollback()
 
-        # If track-adding failed, raise an error now (after persisting settings without broken playlist_id)
+        # If track-adding failed, preserve the playlist ID and return a retryable error.
         if result.get("add_failed"):
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -693,6 +693,8 @@ async def generate_daily_walk_playlist(
                 logger.warning(f"[Daily Walk] Cover generation failed (non-fatal): {cover_err}")
 
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Daily Walk generation failed: {e}", exc_info=True)
         raise HTTPException(

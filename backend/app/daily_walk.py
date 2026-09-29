@@ -53,8 +53,8 @@ redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
 # History TTL: 5 days
 HISTORY_TTL = 5 * 24 * 60 * 60
 
-# Songs-per-episode ratio for Daily Walk (2 songs then 1 episode)
-SONGS_PER_EPISODE = 2
+# Songs-per-episode ratio for Daily Walk (6 songs then 1 episode)
+SONGS_PER_EPISODE = 6
 
 
 # ── Redis helpers ─────────────────────────────────────
@@ -507,7 +507,7 @@ async def generate_daily_walk(
         unplayed_episodes.sort(key=lambda e: e.get("release_date", ""), reverse=True)
         played_episodes.sort(key=lambda e: e.get("release_date", ""), reverse=True)
 
-        # With 2 songs per episode we need more episodes than Daily Drive
+        # With 6 songs per episode, we need fewer episodes than Daily Drive.
         needed = max(1, len(all_song_uris) // SONGS_PER_EPISODE)
         chosen_episodes = unplayed_episodes[:needed]
         if len(chosen_episodes) < needed:
@@ -561,36 +561,31 @@ async def generate_daily_walk(
             existing_playlist_id = None
 
     if existing_playlist_id:
-        # Rename the playlist
+        # Update metadata and atomically replace all existing playlist items.
         async with httpx.AsyncClient() as client:
-            await client.put(
+            rename_response = await client.put(
                 f"{SPOTIFY_API}/playlists/{existing_playlist_id}",
                 headers=auth_headers,
                 json={"name": playlist_name, "description": playlist_desc},
             )
-            # Fetch existing tracks to remove them
-            current_tracks_resp = await client.get(
-                f"{SPOTIFY_API}/playlists/{existing_playlist_id}/tracks",
+            if rename_response.status_code not in (200, 201):
+                raise Exception(
+                    f"Could not rename existing Daily Walk playlist: {rename_response.status_code}"
+                )
+
+            clear_response = await client.put(
+                f"{SPOTIFY_API}/playlists/{existing_playlist_id}/items",
                 headers=auth_headers,
-                params={"fields": "items(track(uri)),next", "limit": 100},
+                json={"uris": []},
             )
-        if current_tracks_resp.status_code == 200:
-            existing_uris = [
-                item["track"]["uri"]
-                for item in current_tracks_resp.json().get("items", [])
-                if item.get("track")
-            ]
-            if existing_uris:
-                async with httpx.AsyncClient() as client:
-                    await client.request(
-                        "DELETE",
-                        f"{SPOTIFY_API}/playlists/{existing_playlist_id}/tracks",
-                        headers=auth_headers,
-                        json={"tracks": [{"uri": u} for u in existing_uris]},
-                    )
+            if clear_response.status_code not in (200, 201):
+                raise Exception(
+                    f"Could not clear existing Daily Walk playlist: {clear_response.status_code}"
+                )
+
         playlist_id = existing_playlist_id
         playlist_url = f"https://open.spotify.com/playlist/{playlist_id}"
-        logger.info(f"Daily Walk: Reusing existing playlist {playlist_id}")
+        logger.info(f"Daily Walk: Cleared and reusing existing playlist {playlist_id}")
     else:
         async with httpx.AsyncClient() as client:
             create_resp = await client.post(
@@ -617,8 +612,8 @@ async def generate_daily_walk(
             add_success = False
 
     if not add_success:
+        # Keep the playlist ID so the next attempt can refill this same playlist.
         logger.error(f"Daily Walk: Some tracks could not be added to playlist {playlist_id}")
-        playlist_id = None
 
     logger.info(f"Daily Walk: Done. Playlist {playlist_id} has {len(final_uris)} items.")
     return {
@@ -680,7 +675,10 @@ async def auto_refresh_daily_walk_playlists() -> None:
                     db=db,
                 )
 
-                # Persist the new playlist ID back
+                if result.get("add_failed"):
+                    raise Exception("Spotify refused to add one or more Daily Walk playlist items")
+
+                # Persist the playlist ID only after all items were added successfully.
                 walk_settings.last_spotify_playlist_id = result["playlist_id"]
                 db.commit()
 
@@ -688,6 +686,7 @@ async def auto_refresh_daily_walk_playlists() -> None:
                 await asyncio.sleep(5)
 
             except Exception as e:
+                db.rollback()
                 logger.error(
                     f"Daily Walk Auto-Refresh: Failed for user {walk_settings.user_id}: {e}",
                     exc_info=True,
