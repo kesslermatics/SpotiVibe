@@ -5,7 +5,7 @@ Flow:
 1. User selects source playlists as inspiration
 2. Fetch tracks from those playlists
 3. Build 7 On-Repeat and 7 selected-playlist inspiration tracks when enabled
-4. Ask Gemini to generate 40 consistently genre-matched gym songs
+4. Ask OpenAI to generate 40 consistently genre-matched gym songs
 5. Search each song on Spotify (with Redis cache and strict match validation)
 6. Delete old gym playlist if it exists
 7. Create a new Spotify playlist with a unique date-based name
@@ -26,6 +26,7 @@ import redis
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.openai_helper import generate_structured
 from app.database import SessionLocal
 from app.models import User, GymPlaylistSettings
 from app.auth import get_valid_spotify_token, refresh_spotify_token
@@ -36,10 +37,15 @@ logger = logging.getLogger(__name__)
 
 SPOTIFY_API = "https://api.spotify.com/v1"
 
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
-)
+SONG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "artist": {"type": "string", "minLength": 1},
+    },
+    "required": ["title", "artist"],
+    "additionalProperties": False,
+}
 
 # Redis Client
 redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
@@ -358,10 +364,10 @@ async def robust_add_items(
     return False
 
 
-# ── Gemini ────────────────────────────────────────────
+# ── OpenAI ────────────────────────────────────────────
 
 
-async def ask_gemini_gym(inspiration_songs: list[str], recent_history: list[str] | None = None) -> dict:
+async def ask_openai_gym(inspiration_songs: list[str], recent_history: list[str] | None = None) -> dict:
     """Create a close-to-taste, ordered 40-track workout soundtrack."""
     song_list = "\n".join(f"- {s}" for s in inspiration_songs)
 
@@ -399,57 +405,27 @@ Return exactly 40 songs in one flat "songs" array. Do not include phases, labels
 Here are the user's inspiration songs:
 {song_list}"""
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.45,
-            "maxOutputTokens": 8192,
-            "responseMimeType": "application/json",
+    schema = {
+        "type": "object",
+        "properties": {
+            "songs": {
+                "type": "array", "items": SONG_SCHEMA,
+                "minItems": 40, "maxItems": 40,
+            }
         },
+        "required": ["songs"],
+        "additionalProperties": False,
     }
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(GEMINI_URL, json=payload)
-
-    if resp.status_code != 200:
-        raise Exception(f"Gemini API error: {resp.status_code} – {resp.text[:300]}")
-
-    data = resp.json()
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError) as e:
-        raise Exception(f"Unexpected Gemini response: {e}")
-
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
-    try:
-        result = json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.error(f"Gemini returned invalid JSON: {text[:500]}")
-        raise Exception(f"Gemini returned invalid JSON: {e}")
-
-    songs = result.get("songs")
-    if not isinstance(songs, list):
-        raise Exception("Gemini response is missing the flat 'songs' array")
-
-    valid_songs = [
-        song
-        for song in songs
-        if isinstance(song, dict)
-        and isinstance(song.get("title"), str)
-        and isinstance(song.get("artist"), str)
-        and song["title"].strip()
-        and song["artist"].strip()
-    ]
-    if len(valid_songs) < 40:
-        raise Exception(f"Gemini returned only {len(valid_songs)} valid songs instead of 40")
-
-    return {"songs": valid_songs[:40]}
+    return await generate_structured(
+        model=settings.openai_curation_model,
+        schema_name="gym_playlist",
+        schema=schema,
+        instructions="You create highly genre-consistent workout playlists with real Spotify-available songs.",
+        input_text=prompt,
+        max_output_tokens=8192,
+        reasoning_effort="low",
+        retries=1,
+    )
 
 
 # ── Main generation pipeline ─────────────────────────
@@ -548,23 +524,23 @@ async def generate_gym_playlist(
         len(playlist_sample),
     )
 
-    # 3. Load recent song history & ask Gemini
+    # 3. Load recent song history & ask OpenAI
     recent_history = get_gym_history(current_user.id)
     logger.info(f"Gym Playlist: {len(recent_history)} songs in 2-day history to avoid")
 
-    logger.info("Gym Playlist: Asking Gemini for recommendations...")
-    gemini_result = await ask_gemini_gym(inspiration, recent_history if recent_history else None)
-    gemini_songs = gemini_result.get("songs", [])
+    logger.info("Gym Playlist: Asking OpenAI for recommendations...")
+    openai_result = await ask_openai_gym(inspiration, recent_history if recent_history else None)
+    openai_songs = openai_result.get("songs", [])
     logger.info(
-        "Gym Playlist: Gemini returned %s consistently matched tracks",
-        len(gemini_songs),
+        "Gym Playlist: OpenAI returned %s consistently matched tracks",
+        len(openai_songs),
     )
 
     # 4. Search each song on Spotify (sequential with delay)
     logger.info("Gym Playlist: Searching songs on Spotify...")
     uris: list[str] = []
     seen_uris: set[str] = set()
-    for song in gemini_songs:
+    for song in openai_songs:
         result = await robust_spotify_search_with_cache(
             song["title"], song["artist"], spotify_token
         )
@@ -578,7 +554,7 @@ async def generate_gym_playlist(
     logger.info(f"Gym Playlist: Found {len(uris)} tracks on Spotify")
 
     # 4b. Save generated songs to history (2-day TTL)
-    save_gym_history(current_user.id, gemini_songs)
+    save_gym_history(current_user.id, openai_songs)
 
     if len(uris) < 10:
         raise Exception(

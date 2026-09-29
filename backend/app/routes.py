@@ -27,6 +27,7 @@ from app.daily_walk import fetch_saved_shows as walk_fetch_saved_shows, generate
 from app.gym_playlist import generate_gym_playlist, parse_gym_sources
 from app.roast import generate_vibe_roast
 from app.cover_gen import generate_playlist_cover, upload_playlist_cover
+from app.openai_helper import generate_structured
 from app.models import GymPlaylistSettings, DailyWalkSettings
 import json
 
@@ -154,7 +155,7 @@ def get_me(current_user: User = Depends(get_current_user)):
     return current_user
 
 
-# ── Discover songs via Gemini + Spotify ──────────────
+# ── Discover songs via OpenAI + Spotify ──────────────
 @router.post("/discover", response_model=DiscoverResponse)
 async def discover(
     payload: DiscoverRequest,
@@ -189,7 +190,7 @@ async def discover(
                 playlist_name = result.get("playlist_name") or "Discover Mix"
                 playlist_desc = result.get("playlist_description") or result.get("mood_summary", "")
 
-                # Refresh token (may have gone stale during Gemini + search pipeline)
+                # Refresh token (may have gone stale during OpenAI + search pipeline)
                 spotify_token = await get_valid_spotify_token(current_user, db)
 
                 # Create playlist via /me/playlists (works in dev mode)
@@ -897,13 +898,32 @@ def gym_playlist_toggle_auto_refresh(
     }
 
 
-# ── Swipe Deck: Gemini-curated from a playlist ───────
+# ── Swipe Deck: OpenAI-curated from a playlist ───────
 SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 
-SWIPE_GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
-)
+SWIPE_SONG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "artist": {"type": "string", "minLength": 1},
+    },
+    "required": ["title", "artist"],
+    "additionalProperties": False,
+}
+
+SWIPE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "songs": {
+            "type": "array",
+            "items": SWIPE_SONG_SCHEMA,
+            "minItems": 30,
+            "maxItems": 30,
+        }
+    },
+    "required": ["songs"],
+    "additionalProperties": False,
+}
 
 import redis as _redis
 _swipe_redis = _redis.Redis.from_url(settings.redis_url, decode_responses=True)
@@ -937,7 +957,7 @@ async def get_swipe_deck(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Analyse a playlist with Gemini, get 30 new song recommendations, search Spotify."""
+    """Analyse a playlist with OpenAI, get 30 new song recommendations, search Spotify."""
     spotify_token = await get_valid_spotify_token(current_user, db)
     headers = {"Authorization": f"Bearer {spotify_token}"}
 
@@ -983,7 +1003,7 @@ async def get_swipe_deck(
 
         avoid_text = "\n".join(f"- {s}" for s in avoid_songs[:150])
 
-        # ── 3. Ask Gemini for 30 new recommendations ──
+        # ── 3. Ask OpenAI for 30 new recommendations ──
         songs_text = "\n".join(f"- {s}" for s in playlist_songs[:100])
 
         prompt = f"""You are a music recommendation expert. Here is a Spotify playlist:
@@ -1008,59 +1028,25 @@ Respond ONLY with this JSON format:
   ]
 }}"""
 
-        gemini_payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.9,
-                "maxOutputTokens": 4096,
-                "responseMimeType": "application/json",
-            },
-        }
+        openai_songs: list[dict] = []
+        try:
+            result = await generate_structured(
+                model=settings.openai_curation_model,
+                schema_name="swipe_deck",
+                schema=SWIPE_SCHEMA,
+                instructions="You are a music recommendation expert. Recommend real songs that fit the playlist's genre, mood, energy, and language.",
+                input_text=prompt,
+                max_output_tokens=4096,
+                reasoning_effort="low",
+                retries=2,
+            )
+            openai_songs = result["songs"]
+        except Exception as error:
+            logger.warning("SWIPE: OpenAI recommendation failed: %s", error)
 
-        gemini_songs: list[dict] = []
-        for attempt in range(3):
-            if attempt > 0:
-                await asyncio.sleep(1)
-            async with httpx.AsyncClient(timeout=60) as client:
-                g_resp = await client.post(SWIPE_GEMINI_URL, json=gemini_payload)
-            if g_resp.status_code != 200:
-                print(f"SWIPE: Gemini attempt {attempt+1} failed: {g_resp.status_code}")
-                continue
-            try:
-                g_data = g_resp.json()
-                g_text = g_data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                if g_text.startswith("```"):
-                    g_text = g_text.split("\n", 1)[1]
-                    if g_text.endswith("```"):
-                        g_text = g_text[:-3]
-                    g_text = g_text.strip()
+        print(f"SWIPE: OpenAI recommended {len(openai_songs)} songs")
 
-                # Try normal parse first
-                try:
-                    parsed = json.loads(g_text)
-                    gemini_songs = parsed.get("songs", [])
-                except json.JSONDecodeError:
-                    # Repair: extract title/artist pairs via regex
-                    import re
-                    pairs = re.findall(
-                        r'"title"\s*:\s*"([^"]+)"\s*,\s*"artist"\s*:\s*"([^"]+)"',
-                        g_text,
-                    )
-                    if pairs:
-                        gemini_songs = [{"title": t, "artist": a} for t, a in pairs]
-                        print(f"SWIPE: Repaired {len(gemini_songs)} songs from broken JSON")
-                    else:
-                        raise
-
-                if gemini_songs:
-                    break
-            except Exception as e:
-                print(f"SWIPE: Gemini parse attempt {attempt+1} failed: {e}")
-                continue
-
-        print(f"SWIPE: Gemini recommended {len(gemini_songs)} songs")
-
-        if not gemini_songs:
+        if not openai_songs:
             raise HTTPException(
                 status_code=500,
                 detail="AI could not generate recommendations. Try again!",
@@ -1106,7 +1092,7 @@ Respond ONLY with this JSON format:
             }
 
         results = await asyncio.gather(
-            *(search_one(song) for song in gemini_songs)
+            *(search_one(song) for song in openai_songs)
         )
 
         # Deduplicate by track ID

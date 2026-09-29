@@ -6,7 +6,7 @@ Flow:
 2. Bulk-fetch audio features for all tracks
 3. Compute average audio features
 4. Extract top genres from top artists
-5. Send everything to Gemini for a sarcastic roast
+5. Send everything to OpenAI for a sarcastic roast
 """
 
 import asyncio
@@ -17,16 +17,22 @@ import re
 import httpx
 
 from app.config import get_settings
+from app.openai_helper import generate_structured
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
 SPOTIFY_API = "https://api.spotify.com/v1"
 
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
-)
+ROAST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "persona": {"type": "string", "minLength": 1},
+        "roast": {"type": "string", "minLength": 1},
+    },
+    "required": ["persona", "roast"],
+    "additionalProperties": False,
+}
 
 
 async def fetch_top_tracks(spotify_token: str, limit: int = 50) -> list[dict]:
@@ -125,24 +131,18 @@ def extract_top_genres(artists: list[dict], limit: int = 10) -> list[str]:
     return [g[0] for g in sorted_genres[:limit]]
 
 
-async def ask_gemini_roast(
+async def ask_openai_roast(
     top_tracks: list[str],
     top_artists: list[str],
     top_genres: list[str],
     avg_features: dict,
 ) -> dict:
-    """Ask Gemini to roast the user's music taste."""
-
-    features_text = "\n".join(
-        f"- {k}: {v}" for k, v in avg_features.items()
-    )
-    tracks_text = "\n".join(f"- {t}" for t in top_tracks[:20])
-    artists_text = "\n".join(f"- {a}" for a in top_artists[:15])
+    """Use GPT-6 Luna to roast the user's music taste."""
+    features_text = "\n".join(f"- {key}: {value}" for key, value in avg_features.items())
+    tracks_text = "\n".join(f"- {track}" for track in top_tracks[:20])
+    artists_text = "\n".join(f"- {artist}" for artist in top_artists[:15])
     genres_text = ", ".join(top_genres[:10])
-
-    prompt = f"""You are a sarcastic, witty music critic.
-
-Here is a Spotify user's data:
+    prompt = f"""Here is a Spotify user's data:
 
 TOP SONGS:
 {tracks_text}
@@ -155,79 +155,21 @@ TOP GENRES: {genres_text}
 AUDIO FEATURES (averages, 0.0 to 1.0 except tempo):
 {features_text}
 
-Your task:
-1. Create a short, roasty persona title (e.g. "Sad-Girl-Indie Protagonist", "Gym-Bro Metal Enjoyer", "Mainstream NPC with Spotify-Wrapped Trauma")
-2. Write a brutal but funny roast about the user's music taste in exactly 3 sentences. Be creative, sarcastic and specific!
-
-Respond ONLY with valid JSON:
-{{
-  "persona": "Your creative persona title",
-  "roast": "Your 3-sentence roast here."
-}}
-
-Rules:
-- ONLY valid JSON, no markdown, no explanation
-- The persona title should be short and punchy (max 5 words)
-- The roast should be exactly 3 sentences long
-- Be brutally honest but funny, not offensive
-- Reference specific artists, genres or features"""
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 1.5,
-            "maxOutputTokens": 2048,
-            "responseMimeType": "application/json",
-        },
-    }
-
-    last_error = None
-    for attempt in range(3):
-        if attempt > 0:
-            logger.info(f"Roast Gemini retry {attempt + 1}/3")
-            await asyncio.sleep(1)
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(GEMINI_URL, json=payload)
-
-        if resp.status_code != 200:
-            last_error = f"Gemini API error: {resp.status_code} – {resp.text[:300]}"
-            continue
-
-        data = resp.json()
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError) as e:
-            last_error = f"Unexpected Gemini response: {e}"
-            continue
-
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-        try:
-            result = json.loads(text)
-            if "persona" in result and "roast" in result:
-                return result
-            last_error = f"JSON missing required keys: {list(result.keys())}"
-            continue
-        except json.JSONDecodeError:
-            # Try to repair truncated JSON
-            repaired = _try_repair_json(text)
-            if repaired and "persona" in repaired and "roast" in repaired:
-                logger.info("Roast: Repaired truncated Gemini JSON")
-                return repaired
-            last_error = f"Invalid JSON after repair attempt: {text[:200]}"
-            continue
-
-    raise Exception(f"Gemini failed after 3 attempts: {last_error}")
+Create a short, punchy roasty persona title (maximum five words) and a brutal but funny, non-offensive roast in exactly three sentences. Reference specific artists, genres, or features."""
+    return await generate_structured(
+        model=settings.openai_utility_model,
+        schema_name="vibe_roast",
+        schema=ROAST_SCHEMA,
+        instructions="You are a sarcastic, witty music critic. Be funny rather than mean.",
+        input_text=prompt,
+        max_output_tokens=1024,
+        reasoning_effort="none",
+        retries=2,
+    )
 
 
 def _try_repair_json(text: str) -> dict | None:
-    """Attempt to repair truncated JSON from Gemini."""
+    """Attempt to repair truncated JSON from OpenAI."""
     try:
         # Try extracting persona and roast via regex
         persona_m = re.search(r'"persona"\s*:\s*"([^"]+)"', text)
@@ -270,7 +212,7 @@ async def generate_vibe_roast(spotify_token: str) -> dict:
     # 3. Compute averages
     avg_features = compute_avg_features(audio_features)
 
-    # 4. Extract data for Gemini
+    # 4. Extract data for OpenAI
     top_track_names = [
         f"{t['name']} - {', '.join(a['name'] for a in t['artists'])}"
         for t in top_tracks_raw
@@ -278,9 +220,9 @@ async def generate_vibe_roast(spotify_token: str) -> dict:
     top_artist_names = [a["name"] for a in top_artists_raw]
     top_genres = extract_top_genres(top_artists_raw)
 
-    # 5. Ask Gemini for the roast
-    logger.info("Vibe Roast: Asking Gemini for roast...")
-    roast_result = await ask_gemini_roast(
+    # 5. Ask OpenAI for the roast
+    logger.info("Vibe Roast: Asking OpenAI for roast...")
+    roast_result = await ask_openai_roast(
         top_track_names, top_artist_names, top_genres, avg_features
     )
     logger.info(f"Vibe Roast: Got persona '{roast_result.get('persona', '?')}'")

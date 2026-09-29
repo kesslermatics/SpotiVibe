@@ -5,7 +5,7 @@ Flow:
 1. Fetch user's top tracks (short_term = "On Repeat") from Spotify
 2. Fetch user's saved shows (podcasts)
 3. User picks which shows to include
-4. Gemini receives all On-Repeat song titles and returns:
+4. OpenAI receives all On-Repeat song titles and returns:
    - 20 songs from the On-Repeat list (shuffled selection)
    - 20 NEW songs that match the same vibe but aren't in On-Repeat
 5. Fetch random recent episodes from the selected shows
@@ -22,16 +22,22 @@ from datetime import date
 import httpx
 import redis
 from app.config import get_settings
+from app.openai_helper import generate_structured
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
 SPOTIFY_API = "https://api.spotify.com/v1"
 
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
-)
+SONG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "artist": {"type": "string", "minLength": 1},
+    },
+    "required": ["title", "artist"],
+    "additionalProperties": False,
+}
 
 # Redis Client initialisieren
 redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
@@ -208,7 +214,7 @@ async def fetch_show_episodes(show_id: str, spotify_token: str, limit: int = 50)
     return episodes
 
 
-async def ask_gemini_daily_drive(
+async def ask_openai_daily_drive(
     on_repeat_songs: list[dict],
     duration_minutes: int,
     day_mode: str,
@@ -281,57 +287,31 @@ Rules:
 - No duplicates within the list
 - Only output valid JSON, no markdown, no explanation"""
 
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"text": f"Here are the user's On-Repeat songs:\n{song_list}"},
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 1.8,
-            "maxOutputTokens": 8192,
-            "topP": 0.95,
-            "topK": 64,
+    schema = {
+        "type": "object",
+        "properties": {
+            "from_repeat": {
+                "type": "array", "items": SONG_SCHEMA,
+                "minItems": num_from_repeat, "maxItems": num_from_repeat,
+            },
+            "new_discoveries": {
+                "type": "array", "items": SONG_SCHEMA,
+                "minItems": num_new, "maxItems": num_new,
+            },
         },
+        "required": ["from_repeat", "new_discoveries"],
+        "additionalProperties": False,
     }
-
-    last_error: Exception | None = None
-    for attempt in range(3):
-        if attempt > 0:
-            logger.warning(f"Daily Drive: Gemini retry {attempt}/2 after invalid JSON...")
-            await asyncio.sleep(2)
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(GEMINI_URL, json=payload)
-
-        if resp.status_code != 200:
-            logger.error(f"Gemini API error: {resp.status_code} - {resp.text[:500]}")
-            raise Exception(f"Gemini API error: {resp.status_code} - {resp.text[:200]}")
-
-        data = resp.json()
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError) as e:
-            logger.error(f"Unexpected Gemini response structure: {json.dumps(data)[:500]}")
-            last_error = Exception(f"Unexpected Gemini response: {e}")
-            continue
-
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as e:
-            logger.error(f"Daily Drive: Gemini invalid JSON (attempt {attempt+1}): {text[:500]}")
-            last_error = Exception(f"Gemini returned invalid JSON: {e}")
-            continue
-
-    raise last_error or Exception("Gemini failed after 3 attempts")
+    return await generate_structured(
+        model=settings.openai_curation_model,
+        schema_name="daily_drive_playlist",
+        schema=schema,
+        instructions="You create precise, varied music recommendations for Spotify playlists.",
+        input_text=f"{prompt}\n\nHere are the user's On-Repeat songs:\n{song_list}",
+        max_output_tokens=8192,
+        reasoning_effort="low",
+        retries=2,
+    )
 
 
 def _pick_best_track(items: list[dict]) -> dict | None:
@@ -455,8 +435,8 @@ async def generate_daily_drive(
             "Listen to more music and try again later!"
         )
 
-    # 2. Fetch podcast episodes EARLY (before Gemini) so the rate limit
-    #    has time to recover while Gemini processes (~5-10s)
+    # 2. Fetch podcast episodes EARLY (before OpenAI) so the rate limit
+    #    has time to recover while OpenAI processes (~5-10s)
     unplayed_episodes: list[dict] = []
     played_episodes: list[dict] = []
     if selected_show_ids:
@@ -473,11 +453,11 @@ async def generate_daily_drive(
                 await asyncio.sleep(0.5)
         logger.info(f"Daily Drive: Found {len(unplayed_episodes)} unplayed + {len(played_episodes)} played episodes")
 
-    # 3. Load recent song history & ask Gemini to curate (NO Spotify API calls → rate limit recovers here!)
+    # 3. Load recent song history & ask OpenAI to curate (NO Spotify API calls → rate limit recovers here!)
     recent_history = get_daily_drive_history(user_id) if user_id else []
     logger.info(f"Daily Drive: {len(recent_history)} songs in 5-day history to avoid")
-    logger.info("Daily Drive: Asking Gemini to curate songs...")
-    gemini_result = await ask_gemini_daily_drive(
+    logger.info("Daily Drive: Asking OpenAI to curate songs...")
+    openai_result = await ask_openai_daily_drive(
         on_repeat,
         duration_minutes=duration_minutes,
         day_mode=day_mode,
@@ -485,8 +465,8 @@ async def generate_daily_drive(
         recent_history=recent_history if recent_history else None,
     )
     logger.info(
-        f"Daily Drive: Gemini returned {len(gemini_result.get('from_repeat', []))} from_repeat, "
-        f"{len(gemini_result.get('new_discoveries', []))} new_discoveries"
+        f"Daily Drive: OpenAI returned {len(openai_result.get('from_repeat', []))} from_repeat, "
+        f"{len(openai_result.get('new_discoveries', []))} new_discoveries"
     )
 
     # 4. Map "from_repeat" songs back to their Spotify URIs (no API calls needed)
@@ -501,7 +481,7 @@ async def generate_daily_drive(
 
     from_repeat_uris: list[str] = []
     unmatched_from_repeat: list[dict] = []
-    for song in gemini_result.get("from_repeat", []):
+    for song in openai_result.get("from_repeat", []):
         key = f"{song['title'].lower().strip()}|||{song['artist'].lower().strip()}"
         if key in on_repeat_map:
             from_repeat_uris.append(on_repeat_map[key]["uri"])
@@ -519,7 +499,7 @@ async def generate_daily_drive(
     all_to_search: list[dict] = []
     for song in unmatched_from_repeat:
         all_to_search.append({"song": song, "type": "from_repeat"})
-    for song in gemini_result.get("new_discoveries", []):
+    for song in openai_result.get("new_discoveries", []):
         all_to_search.append({"song": song, "type": "new_discovery"})
 
     logger.info(f"Daily Drive: Searching {len(all_to_search)} songs on Spotify (sequentiell)...")
@@ -562,9 +542,9 @@ async def generate_daily_drive(
     # 5c. Save all songs to history for future avoidance
     if user_id:
         all_songs_for_history = []
-        for song in gemini_result.get("from_repeat", []):
+        for song in openai_result.get("from_repeat", []):
             all_songs_for_history.append(song)
-        for song in gemini_result.get("new_discoveries", []):
+        for song in openai_result.get("new_discoveries", []):
             all_songs_for_history.append(song)
         save_daily_drive_history(user_id, all_songs_for_history)
 

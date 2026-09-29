@@ -11,7 +11,10 @@ class Settings(BaseSettings):
     spotify_client_id: str = ""
     spotify_client_secret: str = ""
     spotify_redirect_uri: str = "http://127.0.0.1:5173/callback,https://spotivibe.kesslermatics.com/callback"
-    gemini_api_key: str = ""
+    openai_api_key: str = ""
+    openai_curation_model: str = "gpt-6.1-sol"
+    openai_utility_model: str = "gpt-6-luna"
+    openai_image_model: str = "gpt-image-2.5-flare"
     redis_url: str = ""
 
     @property

@@ -1,145 +1,126 @@
-import json
 import asyncio
 import logging
+
 import httpx
+
 from app.config import get_settings
+from app.openai_helper import generate_structured
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
-)
-
-# Fast model for QA validation
-GEMINI_FLASH_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.6-flashh:generateContent?key={settings.gemini_api_key}"
-)
-
 SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
+
+SONG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "artist": {"type": "string", "minLength": 1},
+    },
+    "required": ["title", "artist"],
+    "additionalProperties": False,
+}
+
+DISCOVER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "mood_summary": {"type": "string"},
+        "playlist_name": {"type": ["string", "null"]},
+        "playlist_description": {"type": ["string", "null"]},
+        "songs": {
+            "type": "array",
+            "items": SONG_SCHEMA,
+            "minItems": 50,
+            "maxItems": 50,
+        },
+    },
+    "required": ["mood_summary", "playlist_name", "playlist_description", "songs"],
+    "additionalProperties": False,
+}
+
+WRONG_INDICES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "wrong_indices": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 1},
+        }
+    },
+    "required": ["wrong_indices"],
+    "additionalProperties": False,
+}
 
 SYSTEM_PROMPT = """You are a music recommendation expert. The user will describe a mood, vibe, activity, or specific song preferences.
 
 Your job is to recommend exactly 50 songs that perfectly match their request.
 
-Respond ONLY with valid JSON in this exact format, nothing else:
-{
-  "mood_summary": "A short 1-sentence description of the vibe/mood you interpreted",
-  "songs": [
-    {"title": "Song Name", "artist": "Artist Name"},
-    ...
-  ]
-}
-
 Rules:
 - Always recommend exactly 50 songs
 - Mix well-known and lesser-known tracks
 - Consider the language/culture of the request (e.g. German input → include some German/European artists)
-- Only output valid JSON, no markdown, no explanation"""
+- Do not recommend songs provided as reference context
+- Do not recommend duplicate songs"""
 
 SYSTEM_PROMPT_WITH_PLAYLIST = """You are a music recommendation expert. The user will describe a mood, vibe, activity, or specific song preferences.
 
-Your job is to recommend exactly 50 songs that perfectly match their request.
-You must also generate a creative, catchy playlist name and a short playlist description that captures the vibe.
-
-Respond ONLY with valid JSON in this exact format, nothing else:
-{
-  "mood_summary": "A short 1-sentence description of the vibe/mood you interpreted",
-  "playlist_name": "A creative, catchy playlist name (max 5 words)",
-  "playlist_description": "A short fun description for the playlist (1-2 sentences)",
-  "songs": [
-    {"title": "Song Name", "artist": "Artist Name"},
-    ...
-  ]
-}
+Your job is to recommend exactly 50 songs that perfectly match their request. You must also generate a creative, catchy playlist name and a short playlist description that captures the vibe.
 
 Rules:
 - Always recommend exactly 50 songs
 - Mix well-known and lesser-known tracks
 - Consider the language/culture of the request (e.g. German input → include some German/European artists)
-- Only output valid JSON, no markdown, no explanation
-- The playlist name should be creative and match the vibe, not generic"""
+- Do not recommend songs provided as reference context
+- Do not recommend duplicate songs
+- The playlist name should be creative and match the vibe, not generic
+- Playlist name: maximum five words; playlist description: one or two short sentences"""
 
 
-async def ask_gemini(
+async def ask_openai(
     prompt: str,
     context_songs: list[str] | None = None,
     on_repeat_songs: list[dict] | None = None,
     save_to_playlist: bool = False,
 ) -> dict:
-    """Ask Gemini to interpret the mood and suggest songs."""
-    logger.info(f"[Discover] ask_gemini called - prompt: '{prompt[:100]}...', context_songs: {len(context_songs) if context_songs else 0}, on_repeat: {len(on_repeat_songs) if on_repeat_songs else 0}, save_to_playlist: {save_to_playlist}")
-    system = SYSTEM_PROMPT_WITH_PLAYLIST if save_to_playlist else SYSTEM_PROMPT
-    parts = [{"text": system}]
+    """Interpret a mood and suggest songs with GPT-6.1 Sol."""
+    logger.info(
+        "[Discover] Generating recommendations: context=%s, on_repeat=%s, save_to_playlist=%s",
+        len(context_songs) if context_songs else 0,
+        len(on_repeat_songs) if on_repeat_songs else 0,
+        save_to_playlist,
+    )
+    context_blocks: list[str] = []
 
-    # If the user provided a playlist as context, include it
     if context_songs:
-        song_list = "\n".join(f"- {s}" for s in context_songs)
-        parts.append({
-            "text": (
-                f"The user has a playlist with these songs as reference:\n{song_list}\n\n"
-                "Use this playlist as inspiration for the style/mood/genre. "
-                "Recommend songs that fit the same vibe but DO NOT include any of these songs in your recommendations. "
-                "Avoid duplicates completely."
-            )
-        })
+        song_list = "\n".join(f"- {song}" for song in context_songs)
+        context_blocks.append(
+            "The user has this playlist as reference:\n"
+            f"{song_list}\n\nUse it to infer the style, mood, and genre. "
+            "Recommend songs with the same vibe, but never include these songs."
+        )
 
-    # If "include my taste" is enabled, add user's top tracks as style reference
     if on_repeat_songs:
-        taste_list = "\n".join(f"- {s['title']} by {s['artist']}" for s in on_repeat_songs[:30])
-        parts.append({
-            "text": (
-                f"Here are the user's current favorite/most-played songs (their taste profile):\n{taste_list}\n\n"
-                "Use this to understand the user's music taste and style preferences. "
-                "Your recommendations should align with their taste while still following the user's request. "
-                "DO NOT include any of these songs in your recommendations."
-            )
-        })
+        taste_list = "\n".join(
+            f"- {song['title']} by {song['artist']}" for song in on_repeat_songs[:30]
+        )
+        context_blocks.append(
+            "The user's current favorite/most-played songs are:\n"
+            f"{taste_list}\n\nUse these as their taste profile. Align with this taste, "
+            "but never include these songs."
+        )
 
-    parts.append({"text": f"User request: {prompt}"})
-
-    payload = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {
-            "temperature": 2.0,
-            "maxOutputTokens": 8192,
-        },
-    }
-
-    logger.debug(f"[Discover] Sending request to Gemini API...")
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(GEMINI_URL, json=payload)
-
-    if resp.status_code != 200:
-        logger.error(f"[Discover] Gemini API error: status={resp.status_code}, body={resp.text[:500]}")
-        raise Exception(f"Gemini API error: {resp.status_code} – {resp.text}")
-
-    logger.debug(f"[Discover] Gemini response received, status={resp.status_code}")
-    data = resp.json()
-    
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError) as e:
-        logger.error(f"[Discover] Unexpected Gemini response structure: {e}, data={json.dumps(data)[:500]}")
-        raise Exception(f"Unexpected Gemini response: {e}")
-
-    # Strip markdown code fences if present
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]  # remove first line
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
-    try:
-        result = json.loads(text)
-        logger.info(f"[Discover] Gemini returned {len(result.get('songs', []))} songs, mood: '{result.get('mood_summary', '')[:50]}'")
-        return result
-    except json.JSONDecodeError as e:
-        logger.error(f"[Discover] Failed to parse Gemini JSON: {e}, raw text: {text[:500]}")
-        raise Exception(f"Invalid JSON from Gemini: {e}")
+    context_blocks.append(f"User request: {prompt}")
+    result = await generate_structured(
+        model=settings.openai_curation_model,
+        schema_name="discover_playlist",
+        schema=DISCOVER_SCHEMA,
+        instructions=SYSTEM_PROMPT_WITH_PLAYLIST if save_to_playlist else SYSTEM_PROMPT,
+        input_text="\n\n".join(context_blocks),
+        max_output_tokens=8192,
+        reasoning_effort="low",
+        retries=1,
+    )
+    logger.info("[Discover] OpenAI returned %s songs", len(result["songs"]))
+    return result
 
 
 def _pick_best_track(items: list[dict]) -> dict | None:
@@ -162,7 +143,9 @@ async def search_spotify(query: str, spotify_token: str) -> dict | None:
         )
 
     if resp.status_code != 200:
-        logger.warning(f"[Discover] Spotify search failed for '{query}': status={resp.status_code}, body={resp.text[:200]}")
+        logger.warning(
+            "[Discover] Spotify search failed for '%s': status=%s", query, resp.status_code
+        )
         return None
 
     items = resp.json().get("tracks", {}).get("items", [])
@@ -171,10 +154,9 @@ async def search_spotify(query: str, spotify_token: str) -> dict | None:
         return None
 
     album_images = track.get("album", {}).get("images", [])
-
     return {
         "title": track["name"],
-        "artist": ", ".join(a["name"] for a in track["artists"]),
+        "artist": ", ".join(artist["name"] for artist in track["artists"]),
         "spotify_url": track["external_urls"].get("spotify"),
         "album_image": album_images[0]["url"] if album_images else None,
         "preview_url": track.get("preview_url"),
@@ -184,112 +166,71 @@ async def search_spotify(query: str, spotify_token: str) -> dict | None:
 
 async def validate_spotify_matches(
     original_prompt: str,
-    gemini_recommendations: list[dict],
+    recommendations: list[dict],
     spotify_results: list[dict],
 ) -> list[dict]:
-    """
-    QA Step: Ask Gemini to validate that Spotify search results match the original recommendations.
-    Filters out mismatches where Spotify returned a different song than what was requested.
-    """
-    # Build comparison list: original request vs what Spotify found
+    """Use GPT-6 Luna for a best-effort Spotify result quality check."""
     comparisons = []
-    for i, (orig, found) in enumerate(zip(gemini_recommendations, spotify_results)):
+    for index, (recommended, found) in enumerate(zip(recommendations, spotify_results)):
         if not found.get("spotify_uri"):
-            continue  # Skip songs not found on Spotify
-        comparisons.append({
-            "index": i,
-            "requested": f"{orig['title']} - {orig['artist']}",
-            "found": f"{found['title']} - {found['artist']}",
-            "spotify_uri": found["spotify_uri"],
-        })
-    
+            continue
+        comparisons.append(
+            {
+                "index": index,
+                "requested": f"{recommended['title']} - {recommended['artist']}",
+                "found": f"{found['title']} - {found['artist']}",
+                "spotify_uri": found["spotify_uri"],
+            }
+        )
+
     if not comparisons:
         return spotify_results
-    
-    # Build the validation prompt
+
     comparison_text = "\n".join(
-        f"{c['index']+1}. Requested: \"{c['requested']}\" → Found: \"{c['found']}\""
-        for c in comparisons
+        f"{comparison['index'] + 1}. Requested: \"{comparison['requested']}\" → "
+        f"Found: \"{comparison['found']}\""
+        for comparison in comparisons
     )
-    
-    validation_prompt = f"""You are a music expert doing quality assurance on a playlist.
-
-Original user request: "{original_prompt}"
-
-The AI recommended songs, and Spotify search returned these results. Some might be WRONG matches (different song, cover version, wrong artist, completely different track).
-
-Compare each pair and decide if the found song is CORRECT (same song or acceptable match) or WRONG (different song, wrong artist, not what was requested):
-
-{comparison_text}
-
-Respond ONLY with valid JSON listing the INDICES of WRONG matches (songs that should be removed):
-{{
-  "wrong_indices": [1, 5, 12]
-}}
-
-If ALL matches are correct, return:
-{{
-  "wrong_indices": []
-}}
-
-Rules:
-- A song is CORRECT if it's the same song (even with slight title variations like "Remastered" or "Live")
-- A song is WRONG if it's a completely different song, a cover by another artist, or unrelated
-- Be strict: if the artist is completely different, it's WRONG
-- Only output valid JSON, no explanation"""
-
-    payload = {
-        "contents": [{"parts": [{"text": validation_prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1,  # Low temperature for consistent judgement
-            "maxOutputTokens": 1024,
-        },
-    }
+    instructions = """You are a music expert doing quality assurance on a playlist.
+Compare each requested song with the Spotify result. Mark an item wrong only if it is a different song, a cover by another artist, or unrelated. Slight title variations such as Remastered or Live are acceptable. Be strict when artists differ completely."""
+    input_text = (
+        f'Original user request: "{original_prompt}"\n\n'
+        f"Requested songs and Spotify results:\n{comparison_text}"
+    )
 
     try:
-        logger.info(f"[Discover QA] Validating {len(comparisons)} Spotify matches...")
-        
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(GEMINI_FLASH_URL, json=payload)
-        
-        if resp.status_code != 200:
-            logger.warning(f"[Discover QA] Validation API error: {resp.status_code}, skipping QA")
-            return spotify_results
-        
-        data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        
-        # Parse JSON
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-        
-        result = json.loads(text)
-        wrong_indices = set(result.get("wrong_indices", []))
-        
-        if wrong_indices:
-            logger.info(f"[Discover QA] Found {len(wrong_indices)} mismatches, filtering out...")
-            
-            # Create a set of spotify_uris to remove
-            uris_to_remove = set()
-            for c in comparisons:
-                if (c["index"] + 1) in wrong_indices:  # +1 because we showed 1-indexed
-                    uris_to_remove.add(c["spotify_uri"])
-                    logger.debug(f"[Discover QA] Removing mismatch: {c['requested']} ≠ {c['found']}")
-            
-            # Filter the results
-            filtered = [s for s in spotify_results if s.get("spotify_uri") not in uris_to_remove]
-            logger.info(f"[Discover QA] Kept {len(filtered)}/{len(spotify_results)} songs after validation")
-            return filtered
-        else:
-            logger.info(f"[Discover QA] All {len(comparisons)} matches validated OK")
-            return spotify_results
-            
-    except Exception as e:
-        logger.warning(f"[Discover QA] Validation failed: {e}, skipping QA step")
+        logger.info("[Discover QA] Validating %s Spotify matches", len(comparisons))
+        result = await generate_structured(
+            model=settings.openai_utility_model,
+            schema_name="spotify_match_qa",
+            schema=WRONG_INDICES_SCHEMA,
+            instructions=instructions,
+            input_text=input_text,
+            max_output_tokens=1024,
+            reasoning_effort="none",
+            retries=0,
+        )
+        wrong_indices = set(result["wrong_indices"])
+    except Exception as error:
+        logger.warning("[Discover QA] Validation failed; retaining all results: %s", error)
         return spotify_results
+
+    if not wrong_indices:
+        logger.info("[Discover QA] All %s matches validated", len(comparisons))
+        return spotify_results
+
+    uris_to_remove = {
+        comparison["spotify_uri"]
+        for comparison in comparisons
+        if comparison["index"] + 1 in wrong_indices
+    }
+    filtered = [
+        song for song in spotify_results if song.get("spotify_uri") not in uris_to_remove
+    ]
+    logger.info(
+        "[Discover QA] Kept %s/%s songs after filtering", len(filtered), len(spotify_results)
+    )
+    return filtered
 
 
 async def discover_songs(
@@ -299,18 +240,12 @@ async def discover_songs(
     on_repeat_songs: list[dict] | None = None,
     save_to_playlist: bool = False,
 ) -> dict:
-    """Full pipeline: Gemini interprets mood → Spotify searches for each song (parallel)."""
-    logger.info(f"[Discover] discover_songs called - prompt: '{prompt[:80]}...'")
-    
-    try:
-        gemini_result = await ask_gemini(prompt, context_songs, on_repeat_songs, save_to_playlist)
-    except Exception as e:
-        logger.error(f"[Discover] Gemini call failed: {e}")
-        raise
+    """Generate song recommendations, resolve them on Spotify, and validate matches."""
+    logger.info("[Discover] Starting recommendation pipeline")
+    result = await ask_openai(prompt, context_songs, on_repeat_songs, save_to_playlist)
 
     async def fetch_song(song: dict) -> dict:
-        query = f"{song['title']} {song['artist']}"
-        spotify_data = await search_spotify(query, spotify_token)
+        spotify_data = await search_spotify(f"{song['title']} {song['artist']}", spotify_token)
         if spotify_data:
             return spotify_data
         return {
@@ -322,36 +257,27 @@ async def discover_songs(
             "spotify_uri": None,
         }
 
-    logger.info(f"[Discover] Starting Spotify search for {len(gemini_result.get('songs', []))} songs...")
-    songs = await asyncio.gather(
-        *(fetch_song(song) for song in gemini_result.get("songs", []))
+    songs = await asyncio.gather(*(fetch_song(song) for song in result["songs"]))
+    logger.info(
+        "[Discover] Spotify found %s/%s songs",
+        sum(bool(song.get("spotify_uri")) for song in songs),
+        len(songs),
     )
-    
-    found_count = sum(1 for s in songs if s.get("spotify_uri"))
-    logger.info(f"[Discover] Spotify search complete: {found_count}/{len(songs)} songs found")
+    songs = await validate_spotify_matches(prompt, result["songs"], list(songs))
 
-    # QA Step: Validate Spotify matches against original Gemini recommendations
-    songs = await validate_spotify_matches(
-        original_prompt=prompt,
-        gemini_recommendations=gemini_result.get("songs", []),
-        spotify_results=list(songs),
-    )
-
-    # Deduplicate by Spotify URI (Gemini may suggest the same song twice with different spelling)
     seen_uris: set[str] = set()
     unique_songs = []
     for song in songs:
         uri = song.get("spotify_uri")
+        if uri and uri in seen_uris:
+            continue
         if uri:
-            if uri in seen_uris:
-                continue
             seen_uris.add(uri)
         unique_songs.append(song)
 
-    logger.info(f"[Discover] Returning {len(unique_songs)} unique songs (deduplicated from {len(songs)})")
     return {
-        "mood_summary": gemini_result.get("mood_summary", ""),
-        "playlist_name": gemini_result.get("playlist_name"),
-        "playlist_description": gemini_result.get("playlist_description"),
+        "mood_summary": result["mood_summary"],
+        "playlist_name": result["playlist_name"],
+        "playlist_description": result["playlist_description"],
         "songs": unique_songs,
     }

@@ -10,7 +10,7 @@ can regenerate the playlist every day at 4:00 AM (like Gym Playlist does at 3:00
 
 Flow:
 1. Fetch user's top tracks (short_term = "On Repeat") from Spotify
-2. Gemini curates a song selection (familiar + discoveries)
+2. OpenAI curates a song selection (familiar + discoveries)
 3. Fetch podcast episodes from the user's saved shows selection
 4. Interleave: 2 songs → 1 episode → 2 songs → 1 episode …
 5. Create / overwrite the Spotify playlist
@@ -27,6 +27,7 @@ import redis
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.openai_helper import generate_structured
 from app.models import User, DailyWalkSettings
 from app.database import SessionLocal
 from app.auth import get_valid_spotify_token
@@ -36,10 +37,15 @@ logger = logging.getLogger(__name__)
 
 SPOTIFY_API = "https://api.spotify.com/v1"
 
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-3.6-flash:generateContent?key={settings.gemini_api_key}"
-)
+SONG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "artist": {"type": "string", "minLength": 1},
+    },
+    "required": ["title", "artist"],
+    "additionalProperties": False,
+}
 
 # Shared Redis client
 redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
@@ -166,21 +172,21 @@ async def fetch_show_episodes(show_id: str, spotify_token: str, limit: int = 20)
     return episodes
 
 
-# ── Gemini curation ───────────────────────────────────
+# ── OpenAI curation ───────────────────────────────────
 
-async def ask_gemini_daily_walk(
+async def ask_openai_daily_walk(
     on_repeat_songs: list[dict],
     duration_minutes: int,
     familiarity: int,
     recent_history: list[str] | None = None,
 ) -> dict:
-    """Ask Gemini to curate songs for a Daily Walk playlist."""
+    """Ask OpenAI to curate songs for a Daily Walk playlist."""
     song_list = "\n".join(
         f"- {s['title']} – {s['artist']}" for s in on_repeat_songs
     )
 
     # Daily Walk has shorter music blocks (2 songs between episodes).
-    # Keep the count conservative to avoid Gemini truncation.
+    # Keep the count conservative to avoid OpenAI truncation.
     target_song_count = max(4, min(20, round(duration_minutes / 6.0)))
     num_new = round(target_song_count * familiarity / 100)
     num_from_repeat = target_song_count - num_new
@@ -233,62 +239,31 @@ Rules:
 - No duplicates
 - Only output valid JSON, no markdown, no explanation"""
 
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"text": f"Here are the user's On-Repeat songs:\n{song_list}"},
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 1.6,
-            "maxOutputTokens": 16384,
-            "topP": 0.95,
-            "topK": 64,
-            "responseMimeType": "application/json",
+    schema = {
+        "type": "object",
+        "properties": {
+            "from_repeat": {
+                "type": "array", "items": SONG_SCHEMA,
+                "minItems": num_from_repeat, "maxItems": num_from_repeat,
+            },
+            "new_discoveries": {
+                "type": "array", "items": SONG_SCHEMA,
+                "minItems": num_new, "maxItems": num_new,
+            },
         },
+        "required": ["from_repeat", "new_discoveries"],
+        "additionalProperties": False,
     }
-
-    last_error: Exception | None = None
-    for attempt in range(3):
-        if attempt > 0:
-            logger.warning(f"Daily Walk: Gemini retry {attempt}/2 after invalid JSON...")
-            await asyncio.sleep(2)
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(GEMINI_URL, json=payload)
-
-        if resp.status_code != 200:
-            logger.error(f"Daily Walk Gemini error: {resp.status_code} - {resp.text[:500]}")
-            raise Exception(f"Gemini API error: {resp.status_code}")
-
-        data = resp.json()
-        try:
-            candidate = data["candidates"][0]
-            finish_reason = candidate.get("finishReason", "UNKNOWN")
-            text = candidate["content"]["parts"][0]["text"]
-            if finish_reason not in ("STOP", ""):
-                logger.warning(f"Daily Walk: Gemini finishReason={finish_reason}, response may be truncated")
-        except (KeyError, IndexError) as e:
-            logger.error(f"Daily Walk: Unexpected Gemini response: {json.dumps(data)[:500]}")
-            last_error = Exception(f"Unexpected Gemini response: {e}")
-            continue
-
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as e:
-            logger.error(f"Daily Walk: Gemini invalid JSON (attempt {attempt+1}): {text[:300]}")
-            last_error = Exception(f"Gemini returned invalid JSON: {e}")
-            continue
-
-    raise last_error or Exception("Gemini failed after 3 attempts")
+    return await generate_structured(
+        model=settings.openai_curation_model,
+        schema_name="daily_walk_playlist",
+        schema=schema,
+        instructions="You create precise, relaxed music recommendations for Spotify playlists.",
+        input_text=f"{prompt}\n\nHere are the user's On-Repeat songs:\n{song_list}",
+        max_output_tokens=8192,
+        reasoning_effort="low",
+        retries=2,
+    )
 
 
 # ── Spotify search helpers ─────────────────────────────
@@ -407,7 +382,7 @@ async def generate_daily_walk(
             "Listen to more music and try again!"
         )
 
-    # 2. Fetch podcast episodes early (while Gemini processes)
+    # 2. Fetch podcast episodes early (while OpenAI processes)
     unplayed_episodes: list[dict] = []
     played_episodes: list[dict] = []
     if selected_show_ids:
@@ -423,19 +398,19 @@ async def generate_daily_walk(
                 await asyncio.sleep(0.5)
         logger.info(f"Daily Walk: {len(unplayed_episodes)} unplayed + {len(played_episodes)} played episodes")
 
-    # 3. Gemini curation
+    # 3. OpenAI curation
     recent_history = get_daily_walk_history(user_id) if user_id else []
     logger.info(f"Daily Walk: {len(recent_history)} songs in history to avoid")
-    logger.info("Daily Walk: Asking Gemini to curate songs...")
-    gemini_result = await ask_gemini_daily_walk(
+    logger.info("Daily Walk: Asking OpenAI to curate songs...")
+    openai_result = await ask_openai_daily_walk(
         on_repeat,
         duration_minutes=duration_minutes,
         familiarity=familiarity,
         recent_history=recent_history if recent_history else None,
     )
     logger.info(
-        f"Daily Walk: Gemini returned {len(gemini_result.get('from_repeat', []))} from_repeat, "
-        f"{len(gemini_result.get('new_discoveries', []))} new_discoveries"
+        f"Daily Walk: OpenAI returned {len(openai_result.get('from_repeat', []))} from_repeat, "
+        f"{len(openai_result.get('new_discoveries', []))} new_discoveries"
     )
 
     # 4. Map from_repeat back to Spotify URIs
@@ -449,7 +424,7 @@ async def generate_daily_walk(
 
     from_repeat_uris: list[str] = []
     unmatched_from_repeat: list[dict] = []
-    for song in gemini_result.get("from_repeat", []):
+    for song in openai_result.get("from_repeat", []):
         key = f"{song['title'].lower().strip()}|||{song['artist'].lower().strip()}"
         if key in on_repeat_map:
             from_repeat_uris.append(on_repeat_map[key]["uri"])
@@ -461,13 +436,13 @@ async def generate_daily_walk(
                 unmatched_from_repeat.append(song)
 
     # 5. Search Spotify for unmatched + new discoveries
-    # Refresh token before the search loop – Gemini took ~30s and the token may have expired
+    # Refresh token before the search loop – OpenAI took ~30s and the token may have expired
     if user and db:
         spotify_token = await get_valid_spotify_token(user, db)
 
     all_to_search = (
         [{"song": s, "type": "from_repeat"} for s in unmatched_from_repeat]
-        + [{"song": s, "type": "new_discovery"} for s in gemini_result.get("new_discoveries", [])]
+        + [{"song": s, "type": "new_discovery"} for s in openai_result.get("new_discoveries", [])]
     )
     logger.info(f"Daily Walk: Searching {len(all_to_search)} songs on Spotify...")
 
@@ -503,8 +478,8 @@ async def generate_daily_walk(
     # 5c. Save to history
     if user_id:
         all_for_history = (
-            list(gemini_result.get("from_repeat", []))
-            + list(gemini_result.get("new_discoveries", []))
+            list(openai_result.get("from_repeat", []))
+            + list(openai_result.get("new_discoveries", []))
         )
         save_daily_walk_history(user_id, all_for_history)
 
