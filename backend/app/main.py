@@ -12,6 +12,7 @@ from app.database import engine, Base
 from app.routes import router
 from app.gym_playlist import auto_refresh_gym_playlists
 from app.daily_walk import auto_refresh_daily_walk_playlists
+from app.off_the_radar import auto_refresh_off_the_radar_playlists
 
 # Configure logging to show INFO and above
 logging.basicConfig(
@@ -45,8 +46,15 @@ async def lifespan(app: FastAPI):
         id="daily_walk_auto_refresh",
         replace_existing=True,
     )
+    # Off the Radar auto-refresh at 5:00 AM daily
+    scheduler.add_job(
+        auto_refresh_off_the_radar_playlists,
+        trigger=CronTrigger(hour=5, minute=0),
+        id="off_the_radar_auto_refresh",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info("Scheduler started – Gym Playlist auto-refresh @ 03:00, Daily Walk auto-refresh @ 04:00 daily")
+    logger.info("Scheduler started – Gym @ 03:00, Daily Walk @ 04:00, Off the Radar @ 05:00 daily")
     yield
     # Shutdown
     scheduler.shutdown(wait=False)

@@ -152,6 +152,35 @@ class DailyWalkAutoRefreshRequest(BaseModel):
     familiarity: int = Field(default=50, ge=0, le=100)
 
 
+# ── Off the Radar ─────────────────────────────────────
+class OffTheRadarGenerateRequest(BaseModel):
+    source_playlist_ids: list[str] = []
+    include_on_repeat: bool = True
+
+
+class OffTheRadarGenerateResponse(BaseModel):
+    playlist_url: str
+    playlist_id: str
+    playlist_name: str
+    total_tracks: int
+    inspiration_count: int
+    new_discoveries_count: int
+    auto_refresh: bool
+
+
+class OffTheRadarSettingsResponse(BaseModel):
+    auto_refresh: bool
+    source_playlist_ids: list[str]
+    include_on_repeat: bool
+    last_spotify_playlist_id: str | None
+
+
+class OffTheRadarAutoRefreshRequest(BaseModel):
+    auto_refresh: bool
+    source_playlist_ids: list[str] = []
+    include_on_repeat: bool = True
+
+
 # ── Swipe Deck ────────────────────────────────────────
 class SwipeTrack(BaseModel):
     id: str

@@ -18,6 +18,7 @@ from app.schemas import (
     DailyDriveRequest, DailyDriveResponse,
     GymPlaylistGenerateRequest, GymPlaylistGenerateResponse, GymPlaylistSettingsResponse, GymPlaylistAutoRefreshRequest,
     DailyWalkRequest, DailyWalkResponse, DailyWalkSettingsResponse, DailyWalkAutoRefreshRequest,
+    OffTheRadarGenerateRequest, OffTheRadarGenerateResponse, OffTheRadarSettingsResponse, OffTheRadarAutoRefreshRequest,
     SwipeDeckResponse, RoastResponse,
 )
 from app.auth import create_access_token, get_current_user, get_valid_spotify_token, refresh_spotify_token
@@ -25,10 +26,11 @@ from app.discover import discover_songs
 from app.daily_drive import fetch_saved_shows, generate_daily_drive, fetch_on_repeat_tracks
 from app.daily_walk import fetch_saved_shows as walk_fetch_saved_shows, generate_daily_walk
 from app.gym_playlist import generate_gym_playlist, parse_gym_sources
+from app.off_the_radar import generate_off_the_radar, parse_sources as parse_radar_sources, serialize_sources as serialize_radar_sources
 from app.roast import generate_vibe_roast
 from app.cover_gen import generate_playlist_cover, upload_playlist_cover
 from app.openai_helper import generate_structured
-from app.models import GymPlaylistSettings, DailyWalkSettings
+from app.models import GymPlaylistSettings, DailyWalkSettings, OffTheRadarSettings
 import json
 
 router = APIRouter()
@@ -896,6 +898,120 @@ def gym_playlist_toggle_auto_refresh(
 
     return {
         "auto_refresh": gym_settings.auto_refresh,
+        "message": "Auto-refresh enabled" if payload.auto_refresh else "Auto-refresh disabled",
+    }
+
+
+# ── Off the Radar ─────────────────────────────────────
+@router.post("/off-the-radar/generate", response_model=OffTheRadarGenerateResponse)
+async def off_the_radar_generate(
+    payload: OffTheRadarGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create or replace the user's 30-track daily discovery playlist."""
+    radar_settings = (
+        db.query(OffTheRadarSettings)
+        .filter(OffTheRadarSettings.user_id == current_user.id)
+        .first()
+    )
+    existing_playlist_id = (
+        radar_settings.last_spotify_playlist_id if radar_settings else None
+    )
+
+    try:
+        result = await generate_off_the_radar(
+            source_playlist_ids=payload.source_playlist_ids,
+            include_on_repeat=payload.include_on_repeat,
+            current_user=current_user,
+            db=db,
+            existing_playlist_id=existing_playlist_id,
+        )
+        if not radar_settings:
+            radar_settings = OffTheRadarSettings(user_id=current_user.id)
+            db.add(radar_settings)
+        radar_settings.source_playlist_ids = serialize_radar_sources(
+            payload.source_playlist_ids, payload.include_on_repeat
+        )
+        radar_settings.last_spotify_playlist_id = result["playlist_id"]
+        db.commit()
+        result["auto_refresh"] = radar_settings.auto_refresh
+        return result
+    except HTTPException:
+        raise
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error))
+    except Exception as error:
+        db.rollback()
+        logger.error("Off the Radar generation failed: %s", error, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Off the Radar could not be generated: {error}",
+        )
+
+
+@router.get("/off-the-radar/settings", response_model=OffTheRadarSettingsResponse)
+def off_the_radar_settings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    radar_settings = (
+        db.query(OffTheRadarSettings)
+        .filter(OffTheRadarSettings.user_id == current_user.id)
+        .first()
+    )
+    if not radar_settings:
+        return {
+            "auto_refresh": False,
+            "source_playlist_ids": [],
+            "include_on_repeat": True,
+            "last_spotify_playlist_id": None,
+        }
+    source_playlist_ids, include_on_repeat = parse_radar_sources(
+        radar_settings.source_playlist_ids
+    )
+    return {
+        "auto_refresh": radar_settings.auto_refresh,
+        "source_playlist_ids": source_playlist_ids,
+        "include_on_repeat": include_on_repeat,
+        "last_spotify_playlist_id": radar_settings.last_spotify_playlist_id,
+    }
+
+
+@router.put("/off-the-radar/auto-refresh")
+def off_the_radar_toggle_auto_refresh(
+    payload: OffTheRadarAutoRefreshRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not payload.source_playlist_ids and not payload.include_on_repeat:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Enable On Repeat or select at least one source playlist.",
+        )
+    try:
+        radar_settings = (
+            db.query(OffTheRadarSettings)
+            .filter(OffTheRadarSettings.user_id == current_user.id)
+            .first()
+        )
+        if not radar_settings:
+            radar_settings = OffTheRadarSettings(user_id=current_user.id)
+            db.add(radar_settings)
+        radar_settings.auto_refresh = payload.auto_refresh
+        radar_settings.source_playlist_ids = serialize_radar_sources(
+            payload.source_playlist_ids, payload.include_on_repeat
+        )
+        db.commit()
+    except Exception as error:
+        db.rollback()
+        logger.error("Could not save Off the Radar setting: %s", error)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not save Off the Radar settings.",
+        )
+    return {
+        "auto_refresh": radar_settings.auto_refresh,
         "message": "Auto-refresh enabled" if payload.auto_refresh else "Auto-refresh disabled",
     }
 

@@ -59,6 +59,14 @@ const tiles: Tile[] = [
         route: "/vibe-roast",
     },
     {
+        id: "off-the-radar",
+        emoji: "🕵️",
+        title: "Off the Radar",
+        description: "30 daily discoveries beyond your current rotation",
+        color: "from-indigo-500/20 to-fuchsia-500/10 hover:ring-indigo-500/40",
+        route: "/off-the-radar",
+    },
+    {
         id: "gym-playlist",
         emoji: "🏋️‍♂️",
         title: "Gym Playlist",
@@ -116,7 +124,7 @@ export default function HomePage({ onLogout }: { onLogout: () => void }) {
                 {/* Feature Tiles */}
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                     {tiles.map((tile) => {
-                        const isAvailable = tile.id === "discover" || tile.id === "daily-drive" || tile.id === "daily-walk" || tile.id === "gym-playlist" || tile.id === "swipe" || tile.id === "vibe-roast";
+                        const isAvailable = tile.id === "discover" || tile.id === "daily-drive" || tile.id === "daily-walk" || tile.id === "gym-playlist" || tile.id === "off-the-radar" || tile.id === "swipe" || tile.id === "vibe-roast";
                         return (
                             <button
                                 key={tile.id}

@@ -23,6 +23,16 @@ class GymPlaylistSettings(Base):
     last_spotify_playlist_id = Column(String, nullable=True)
 
 
+class OffTheRadarSettings(Base):
+    __tablename__ = "off_the_radar_settings"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False, index=True)
+    auto_refresh = Column(Boolean, default=False, nullable=False)
+    source_playlist_ids = Column(Text, default="{}", nullable=False)
+    last_spotify_playlist_id = Column(String, nullable=True)
+
+
 class DailyWalkSettings(Base):
     __tablename__ = "daily_walk_settings"
 
